@@ -1206,8 +1206,13 @@ export async function saveBrief(root, team, text) {
 // with a header on first use. Concurrent appends are serialized with a lock.
 // ---------------------------------------------------------------------------
 
+// Project memory lives in the repo's agent-team/ folder so it never collides
+// with other harnesses' root-level MEMORY.md / AGENTS.md conventions.
+export const MEMO_DIR_NAME = "agent-team";
+export const MEMO_FILE_NAME = "MEMORY.md";
+
 export function memoFile(cwd) {
-  return path.join(cwd || ".", "MEMORY.md");
+  return path.join(cwd || ".", MEMO_DIR_NAME, MEMO_FILE_NAME);
 }
 
 export async function memoRead(cwd) {
@@ -1219,10 +1224,11 @@ export async function memoRead(cwd) {
 }
 
 export async function memoAppend(cwd, { team, name, role, body }) {
-  const file = memoFile(cwd);
+  const file = memoFile(cwd); // <cwd>/agent-team/MEMORY.md
   const dir = path.dirname(file);
+  // The lock dir lives inside agent-team/, so create it before locking.
+  await fsp.mkdir(dir, { recursive: true });
   return withDirLock(dir, async () => {
-    await fsp.mkdir(dir, { recursive: true });
     let existing = "";
     try {
       existing = await fsp.readFile(file, "utf8");

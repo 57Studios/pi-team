@@ -297,7 +297,9 @@ const main = async () => {
     );
     txt = await bus.memoRead(dir);
     ok("all concurrent notes survived", [0,1,2,3,4,5].every((i) => txt.includes(`note ${i}`)));
-    ok("no lock left behind", !fs.existsSync(path.join(dir, ".lock")));
+    ok("no lock left behind", !fs.existsSync(path.join(dir, "agent-team", ".lock")));
+    ok("file lives under agent-team/", fs.existsSync(path.join(dir, "agent-team", "MEMORY.md")));
+    ok("no stray root-level MEMORY.md", !fs.existsSync(path.join(dir, "MEMORY.md")));
     fs.rmSync(dir, { recursive: true, force: true });
   });
 

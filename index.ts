@@ -196,7 +196,7 @@ export default function (pi: ExtensionAPI) {
       lines.push("No reviewers on this team — the coordinator reviews completed work.");
     }
     lines.push(
-      "Project memory: read MEMORY.md in the working directory when you start work; record decisions, gotchas, and next steps with team memo.",
+      "Project memory: read agent-team/MEMORY.md in the working directory when you start work; record decisions, gotchas, and next steps with team memo.",
     );
     // Team protocol (role-aware, derived from the roster).
     lines.push("Protocol:");

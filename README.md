@@ -53,21 +53,23 @@ injected at the start of his next turn, does the work, and sends
 
 pi persists each agent's **private** session transcript, and loads `AGENTS.md`
 as *input* — neither is shared project memory. pi-team adds one: a
-`MEMORY.md` in the working directory (the repo all agents share), so a team
-spawned with "open terminal here" leaves a durable, human-readable project
-memory:
+`agent-team/MEMORY.md` in the working directory (the repo all agents share),
+so a team spawned with "open terminal here" leaves a durable, human-readable
+project memory — tucked in its own `agent-team/` folder so it never collides
+with other harnesses' root-level `MEMORY.md` / `AGENTS.md` conventions:
 
-- **Auto-seeded** on join/spawn: if `MEMORY.md` doesn't exist, it's created
-  with a header and a starter entry.
+- **Auto-seeded** on join/spawn: if `agent-team/MEMORY.md` doesn't exist, it's
+  created with a header and a starter entry.
 - **Appended via `team memo --body "..."` / `/team memo <text>`** — each entry
   is date- and author-tagged (`## 2026-08-09 12:49 · Bee (implementer)`),
   so the file doubles as an activity log. Concurrent appends are serialized
   (lock file, stale-lock recovery) — no lost entries.
 - **Referenced in the briefing**: every agent's standing briefing says to read
-  MEMORY.md when starting work and record decisions/gotchas/next steps with
-  `team memo`, so a newly spawned member has project history, not just a role.
-- Keep it in git or add `MEMORY.md` to `.gitignore` — your call; it's a plain
-  markdown file either way.
+  `agent-team/MEMORY.md` when starting work and record decisions/gotchas/next
+  steps with `team memo`, so a newly spawned member has project history, not
+  just a role.
+- Keep it in git or add `agent-team/` to `.gitignore` — your call; it's plain
+  markdown either way.
 
 ## What each side sees
 
