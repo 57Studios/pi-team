@@ -563,7 +563,11 @@ export default function (pi: ExtensionAPI) {
     const members = await bus.loadMembers(me.root, me.team);
     const brief = await bus.loadBrief(me.root, me.team);
     const briefingBlock = `[team-context] ${buildBriefing(me, members, brief)}`;
-    const briefingHash = hashStr(briefingBlock);
+    // Hash on a liveness-stripped copy: idle/offline flapping must NOT
+    // re-inject the briefing every prompt (that was an empty-looking
+    // "[team]" box on every prompt). Only stable changes (role, mission,
+    // roster membership) trigger re-injection.
+    const briefingHash = hashStr(briefingBlock.replace(/, offline\)/g, ")"));
     // Inject only when needed: first run of a session, after compaction, or
     // when role/mission/roster changed. Steady state costs zero tokens and
     // the briefing still lives in context (it was already injected). Compaction
@@ -1476,6 +1480,7 @@ export default function (pi: ExtensionAPI) {
             : Array.isArray(content)
               ? content.map((p: any) => p?.text || "").join("\n")
               : "";
+        if (!text.trim()) return undefined; // never render an empty "[team]" block
         const box = new tui.Box(1, 1, (t: string) => theme.bg("customMessageBg", t));
         box.addChild(new tui.Text(theme.bold("[team]")));
         const lines = text.split("\n");
