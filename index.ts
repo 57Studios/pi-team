@@ -48,6 +48,7 @@ export default function (pi: ExtensionAPI) {
   let lastTeam: { root: string; team: string; id: string } | undefined;
   let watcher: fs.FSWatcher | undefined;
   let heartbeat: NodeJS.Timeout | undefined;
+  let widgetTimer: NodeJS.Timeout | undefined;
   let lastTouchAt = 0;
   // Standing-briefing injection state: inject on the first run of a session,
   // after compaction, or when the briefing content changed — not every prompt.
@@ -277,6 +278,10 @@ export default function (pi: ExtensionAPI) {
       clearInterval(heartbeat);
       heartbeat = undefined;
     }
+    if (widgetTimer) {
+      clearInterval(widgetTimer);
+      widgetTimer = undefined;
+    }
     if (watcher) {
       try {
         watcher.close();
@@ -327,6 +332,14 @@ export default function (pi: ExtensionAPI) {
     heartbeat = setInterval(() => {
       bus.touchMember(me.root, me.team, me.id).catch(() => {});
     }, bus.HEARTBEAT_MS);
+    // Keep the footer status live even with zero events: without this, a
+    // member that joined early and then sat idle would show a stale member
+    // count (e.g. "2 members" while the team grew to 4).
+    if (widgetTimer) clearInterval(widgetTimer);
+    widgetTimer = setInterval(() => {
+      const c = ctx;
+      if (c) refreshWidget(c, me).catch(() => {});
+    }, 30_000);
     const watcherCheck = async () => {
       if (busy) return;
       busy = true;
