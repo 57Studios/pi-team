@@ -519,6 +519,7 @@ export async function loadTasks(root, team) {
 
 // task shape:
 // { id, title, body, assignee (name | role:<role> | null), status, priority,
+//   kind ("work"|"review"), reviewOf (task id, when kind=review),
 //   criteria[], dependsOn[], createdBy, createdByName, createdAt, assignedAt,
 //   startedAt, doneAt, evidence, blockedReason, failReason, updatedAt }
 
@@ -534,10 +535,27 @@ export async function createTask(root, team, spec) {
   if (assignee && !/^[A-Za-z0-9._\- ]{1,40}$/.test(assignee) && !assignee.startsWith("role:")) {
     return { ok: false, error: "assignee must be a member name or role:<role>" };
   }
+  const kind = spec.kind === "review" ? "review" : "work";
+  const reviewOf = kind === "review" ? String(spec.reviewOf || "").trim() || null : null;
+  if (kind === "review" && !reviewOf) {
+    return { ok: false, error: "a review task requires review_of (the task id being reviewed)" };
+  }
   return withTeamLock(root, team, async () => {
     const tasks = await loadTasks(root, team);
     if (tasks.some((t) => t.id === id)) {
       return { ok: false, error: `task id "${id}" already exists` };
+    }
+    const warnings = [];
+    if (kind === "review" && reviewOf) {
+      const reviewed = tasks.find((t) => t.id === reviewOf);
+      if (!reviewed) {
+        return { ok: false, error: `review task references unknown task "${reviewOf}"` };
+      }
+      if (reviewed.assignee && assignee && reviewed.assignee === assignee) {
+        warnings.push(
+          `reviewer assignment matches the reviewed task's assignee (${assignee}) — use a different role/name for an independent review`,
+        );
+      }
     }
     const task = {
       id,
@@ -546,6 +564,8 @@ export async function createTask(root, team, spec) {
       assignee,
       status: "queued",
       priority: spec.priority === "high" ? "high" : "normal",
+      kind,
+      reviewOf,
       criteria: (spec.criteria || []).map((c) => String(c).trim()).filter(Boolean),
       dependsOn: (spec.dependsOn || []).map(String).filter(Boolean),
       createdBy: spec.createdBy || null,
@@ -561,10 +581,15 @@ export async function createTask(root, team, spec) {
     };
     tasks.push(task);
     await writeJsonAtomic(path.join(teamDir(root, team), "tasks.json"), { tasks });
-    await appendLine(
-      path.join(teamDir(root, team), "log.jsonl"),
-      JSON.stringify({ ts: Date.now(), event: "task_created", task: id, title, assignee }),
-    );
+    await appendTeamLog(root, team, {
+      ts: Date.now(),
+      event: "task_created",
+      task: id,
+      title,
+      assignee,
+      kind,
+      reviewOf,
+    });
     // Atomic with the create: notify assignees so the task lands in their inbox.
     let notified = 0;
     if (task.assignee) {
@@ -576,23 +601,27 @@ export async function createTask(root, team, spec) {
         const criteriaText = task.criteria.length
           ? `\nAcceptance criteria:\n- ${task.criteria.join("\n- ")}`
           : "";
+        const body =
+          kind === "review"
+            ? `REVIEW task for ${reviewOf}: ${task.title}\n\n${task.body || ""}\n\n` +
+              `Read the evidence on ${reviewOf} (team task_show task_id=${reviewOf}), then pass with team task_done task_id=${task.id} --evidence "<review findings>", or bounce it back with team task_fail task_id=${task.id} --body "<issues>".`
+            : `Task: ${task.title}\n\n${task.body || ""}${criteriaText}\n\n` +
+              `Complete it with: team task_done task_id=${task.id} --evidence "<what you changed, file refs, validation>"`;
         await sendMessage(root, team, {
           type: "task",
           from: task.createdBy,
           fromName: task.createdByName || task.createdBy,
           fromRole,
           to: task.assignee,
-          subject: `assigned: ${task.title}`,
-          body:
-            `Task: ${task.title}\n\n${task.body || ""}${criteriaText}\n\n` +
-            `Complete it with: team task_done task_id=${task.id} --evidence "<what you changed, file refs, validation>"`,
+          subject: kind === "review" ? `assigned: review of ${reviewOf}` : `assigned: ${task.title}`,
+          body,
           priority: "high",
           targets: tgt.ids,
         });
         notified = tgt.ids.length;
       }
     }
-    return { ok: true, task, notified };
+    return { ok: true, task, notified, warnings };
   });
 }
 
@@ -600,9 +629,15 @@ export async function createTask(root, team, spec) {
 //   - the assignee (by name), anyone with the assigned role, or a coordinator
 //     may change status; unassigned tasks are claimable by anyone;
 //   - reassignment requires the creator or a coordinator.
-// Enforcement (the "typed artifact" bit): a task cannot flip to done without
-// evidence. Unfinished dependencies produce warnings (not hard blocks) so the
-// worker sees exactly what a gate would flag, without an engine.
+// Enforcement (the "typed artifact" bit):
+//   - a task cannot flip to done without evidence;
+//   - done is HARD-blocked on unfinished dependencies unless the actor passes
+//     dep_override with a reason (jcode's "parent cannot close with open gaps",
+//     with an escape hatch);
+//   - failing a REVIEW task bounces its reviewed task back to running and
+//     notifies the implementer (the critique gate, made concrete).
+// Notifications are atomic with transitions: done -> creator, blocked/failed
+// -> coordinator (fallback creator), review-fail -> reviewed task's assignee.
 export async function updateTask(root, team, taskId, patch, actor) {
   const meta = await loadTeam(root, team);
   if (!meta) return { ok: false, error: `Team "${team}" does not exist.` };
@@ -611,6 +646,8 @@ export async function updateTask(root, team, taskId, patch, actor) {
     const task = tasks.find((t) => t.id === taskId);
     if (!task) return { ok: false, error: `unknown task "${taskId}"` };
     const warnings = [];
+    let bouncedTaskId = null;
+    let acceptedTaskId = null;
 
     if (patch.status !== undefined && patch.status !== task.status) {
       const to = String(patch.status);
@@ -638,14 +675,43 @@ export async function updateTask(root, team, taskId, patch, actor) {
               "evidence is required to complete a task: describe what changed (with file refs), and what validation you ran. A bare 'done' is rejected.",
           };
         }
+        const unfinished = [];
         for (const did of task.dependsOn) {
           const dep = tasks.find((x) => x.id === did);
-          if (!dep || dep.status !== "done") warnings.push(did);
+          if (!dep || dep.status !== "done") unfinished.push(did);
+        }
+        if (unfinished.length && !String(patch.depOverride || "").trim()) {
+          return {
+            ok: false,
+            error: `task ${taskId} has unfinished dependencies: ${unfinished.join(", ")}. Complete them first, or pass dep_override with a reason to accept the task as-is.`,
+          };
+        }
+        if (unfinished.length) {
+          warnings.push(...unfinished.map((d) => `${d} (accepted via dep_override)`));
         }
         task.evidence = evidence;
         task.doneAt = Date.now();
       }
-      if (to === "blocked") task.blockedReason = String(patch.reason || "").trim() || null;
+      // A passing REVIEW task accepts the reviewed work (closes the loop with
+      // the bounce: fail -> running, pass -> done).
+      if (to === "done" && task.kind === "review" && task.reviewOf) {
+        const reviewed = tasks.find((x) => x.id === task.reviewOf);
+        if (reviewed && reviewed.status === "running") {
+          reviewed.status = "done";
+          reviewed.doneAt = Date.now();
+          reviewed.evidence =
+            reviewed.evidence ||
+            `Accepted by review task ${task.id} (${actor.name}). Review evidence: ${task.evidence}`;
+          reviewed.updatedAt = Date.now();
+          acceptedTaskId = reviewed.id;
+          await appendTeamLog(root, team, {
+            ts: Date.now(),
+            event: "task_accepted",
+            task: reviewed.id,
+            by_review: taskId,
+          });
+        }
+      }
       if (to === "running") {
         for (const did of task.dependsOn) {
           const dep = tasks.find((x) => x.id === did);
@@ -653,7 +719,30 @@ export async function updateTask(root, team, taskId, patch, actor) {
         }
         task.startedAt = Date.now();
       }
-      if (to === "failed") task.failReason = String(patch.reason || "").trim() || null;
+      if (to === "blocked") task.blockedReason = String(patch.reason || "").trim() || null;
+      if (to === "failed") {
+        task.failReason = String(patch.reason || "").trim() || null;
+        // A failed REVIEW task bounces the reviewed work back to running:
+        // the implementer must fix and re-complete (the critique gate).
+        if (task.kind === "review" && task.reviewOf) {
+          const reviewed = tasks.find((x) => x.id === task.reviewOf);
+          if (reviewed && reviewed.status === "done") {
+            reviewed.status = "running";
+            reviewed.startedAt = Date.now();
+            reviewed.doneAt = null;
+            reviewed.evidence = null;
+            reviewed.updatedAt = Date.now();
+            bouncedTaskId = reviewed.id;
+            await appendTeamLog(root, team, {
+              ts: Date.now(),
+              event: "task_bounced",
+              task: reviewed.id,
+              by_review: taskId,
+              reason: task.failReason || "",
+            });
+          }
+        }
+      }
       if (to === "queued") {
         task.startedAt = null;
         task.doneAt = null;
@@ -663,16 +752,20 @@ export async function updateTask(root, team, taskId, patch, actor) {
       }
       task.status = to;
       task.updatedAt = Date.now();
-      await appendLine(
-        path.join(teamDir(root, team), "log.jsonl"),
-        JSON.stringify({ ts: Date.now(), event: "task_status", task: taskId, status: to, by: actor.name }),
-      );
+      await appendTeamLog(root, team, {
+        ts: Date.now(),
+        event: "task_status",
+        task: taskId,
+        status: to,
+        by: actor.name,
+      });
     }
 
-    // Atomic with the transition: notify the creator when a task completes.
+    // Atomic notifications for the transition.
     let notified = 0;
+    const members = await loadMembers(root, team);
+
     if (task.status === "done" && task.createdByName) {
-      const members = await loadMembers(root, team);
       const tgt = resolveTargets(members, actor.id, task.createdByName);
       if (!tgt.error && tgt.ids.length) {
         await sendMessage(root, team, {
@@ -685,7 +778,75 @@ export async function updateTask(root, team, taskId, patch, actor) {
           body: task.evidence || "",
           targets: tgt.ids,
         });
-        notified = tgt.ids.length;
+        notified += tgt.ids.length;
+      }
+    }
+
+    if (task.status === "blocked" || task.status === "failed") {
+      // Escalate to the coordinator; fall back to the creator.
+      let targets = [];
+      const coord = resolveTargets(members, actor.id, "role:coordinator");
+      if (!coord.error) targets = coord.ids;
+      if (!targets.length && task.createdByName) {
+        const creator = resolveTargets(members, actor.id, task.createdByName);
+        if (!creator.error) targets = creator.ids;
+      }
+      if (targets.length) {
+        const type = task.status === "blocked" ? "task_blocked" : "task_failed";
+        await sendMessage(root, team, {
+          type,
+          from: actor.id,
+          fromName: actor.name,
+          fromRole: actor.role,
+          to: "coordinator",
+          subject: `task ${task.status}: ${task.title}`,
+          body: task.status === "blocked" ? task.blockedReason || "" : task.failReason || "",
+          targets,
+        });
+        notified += targets.length;
+      }
+    }
+
+    if (bouncedTaskId) {
+      const bounced = tasks.find((x) => x.id === bouncedTaskId);
+      if (bounced && bounced.assignee) {
+        const tgt = resolveTargets(members, actor.id, bounced.assignee);
+        if (!tgt.error && tgt.ids.length) {
+          await sendMessage(root, team, {
+            type: "task_bounced",
+            from: actor.id,
+            fromName: actor.name,
+            fromRole: actor.role,
+            to: bounced.assignee,
+            subject: `review failed: ${bounced.title}`,
+            body:
+              `Review of task ${bounced.id} failed by ${actor.name}: ${task.failReason || "no reason given"}\n` +
+              `Please fix the issues and re-complete with task_done --evidence.`,
+            priority: "high",
+            targets: tgt.ids,
+          });
+          notified += tgt.ids.length;
+        }
+      }
+    }
+
+    if (acceptedTaskId) {
+      const accepted = tasks.find((x) => x.id === acceptedTaskId);
+      if (accepted?.createdByName) {
+        const tgt = resolveTargets(members, actor.id, accepted.createdByName);
+        if (!tgt.error && tgt.ids.length) {
+          await sendMessage(root, team, {
+            type: "task_done",
+            from: actor.id,
+            fromName: actor.name,
+            fromRole: actor.role,
+            to: accepted.createdByName,
+            subject: `task accepted: ${accepted.title}`,
+            body: accepted.evidence || "",
+            targets: tgt.ids,
+          });
+          notified += tgt.ids.length;
+        }
       }
     }
 
@@ -702,6 +863,103 @@ export async function updateTask(root, team, taskId, patch, actor) {
     }
 
     await writeJsonAtomic(path.join(teamDir(root, team), "tasks.json"), { tasks });
-    return { ok: true, task, warnings, notified };
+    return { ok: true, task, warnings, notified, bouncedTaskId, acceptedTaskId };
   });
+}
+
+// ---------------------------------------------------------------------------
+// Team hygiene: log rotation, temp-file sweep, dead-member pruning
+// ---------------------------------------------------------------------------
+
+export const TEAM_LOG_MAX_BYTES = 5 * 1024 * 1024;
+const TEAM_LOG_KEEP = 3;
+const SWEEP_TMP_OLDER_MS = 60 * 60 * 1000; // 1 hour
+export const AUTO_PRUNE_OLDER_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+async function rotateLogIfNeeded(root, team) {
+  const file = path.join(teamDir(root, team), "log.jsonl");
+  try {
+    const st = await fsp.stat(file);
+    if (st.size <= TEAM_LOG_MAX_BYTES) return;
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    await fsp.rename(file, `${file}.${stamp}`).catch(() => {});
+    const dir = path.dirname(file);
+    const base = path.basename(file);
+    const rotated = (await fsp.readdir(dir))
+      .filter((f) => f.startsWith(base + "."))
+      .sort();
+    for (const old of rotated.slice(0, Math.max(0, rotated.length - TEAM_LOG_KEEP))) {
+      await fsp.unlink(path.join(dir, old)).catch(() => {});
+    }
+  } catch {
+    /* no log yet */
+  }
+}
+
+// Append to the team audit log, rotating at TEAM_LOG_MAX_BYTES and keeping the
+// last TEAM_LOG_KEEP rotated files so storage cannot grow unboundedly.
+export async function appendTeamLog(root, team, entry) {
+  const file = path.join(teamDir(root, team), "log.jsonl");
+  await fsp.mkdir(path.dirname(file), { recursive: true });
+  await rotateLogIfNeeded(root, team);
+  await fsp.appendFile(file, JSON.stringify(entry) + "\n", "utf8");
+}
+
+// Remove members whose lastSeen is older than `olderThanMs`. Safe to run
+// automatically (long default) or explicitly via /team prune.
+export async function pruneMembers(root, team, { olderThanMs = 24 * 60 * 60 * 1000 } = {}) {
+  const meta = await loadTeam(root, team);
+  if (!meta) return { ok: false, error: `Team "${team}" does not exist.` };
+  return withTeamLock(root, team, async () => {
+    const members = await loadMembers(root, team);
+    const now = Date.now();
+    let removed = 0;
+    for (const [sid, m] of Object.entries(members)) {
+      if (m && now - (m.lastSeen || 0) > olderThanMs) {
+        delete members[sid];
+        removed++;
+      }
+    }
+    if (removed) {
+      await writeJsonAtomic(path.join(teamDir(root, team), "members.json"), { members });
+      await appendTeamLog(root, team, { ts: now, event: "members_pruned", count: removed });
+    }
+    return { ok: true, removed };
+  });
+}
+
+// Opportunistic hygiene sweep: delete stale .tmp-* files (killed writers),
+// auto-prune members gone > 7 days, rotate an oversized log. Callers throttle
+// this to ~1/hour.
+export async function sweepTeam(root, team) {
+  const base = teamDir(root, team);
+  const dirs = [base, path.join(base, "board")];
+  try {
+    const inboxRoot = path.join(base, "inbox");
+    const subs = await fsp.readdir(inboxRoot);
+    dirs.push(...subs.map((s) => path.join(inboxRoot, s)));
+  } catch {
+    /* no inbox yet */
+  }
+  const now = Date.now();
+  for (const dir of dirs) {
+    let names = [];
+    try {
+      names = await fsp.readdir(dir);
+    } catch {
+      continue;
+    }
+    for (const n of names) {
+      if (!n.includes(".tmp-")) continue;
+      const full = path.join(dir, n);
+      try {
+        const st = await fsp.stat(full);
+        if (now - st.mtimeMs > SWEEP_TMP_OLDER_MS) await fsp.unlink(full);
+      } catch {
+        /* gone already */
+      }
+    }
+  }
+  await pruneMembers(root, team, { olderThanMs: AUTO_PRUNE_OLDER_MS }).catch(() => {});
+  await rotateLogIfNeeded(root, team).catch(() => {});
 }

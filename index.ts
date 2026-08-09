@@ -158,11 +158,17 @@ export default function (pi: ExtensionAPI) {
           ? "TASK"
           : m.type === "task_done"
             ? "TASK DONE"
-            : m.type === "report"
-              ? "REPORT"
-              : m.type === "broadcast"
-                ? "BROADCAST"
-                : "DM";
+            : m.type === "task_blocked"
+              ? "TASK BLOCKED"
+              : m.type === "task_failed"
+                ? "TASK FAILED"
+                : m.type === "task_bounced"
+                  ? "REVIEW FAILED"
+                  : m.type === "report"
+                    ? "REPORT"
+                    : m.type === "broadcast"
+                      ? "BROADCAST"
+                      : "DM";
       const head = `${kind} from ${m.fromName || m.from} (${m.fromRole || "agent"})${
         m.subject ? ` — ${m.subject}` : ""
       }${m.priority === "high" ? " [high priority]" : ""}`;
@@ -246,6 +252,7 @@ export default function (pi: ExtensionAPI) {
               c.ui.notify(`[team:${me.team}] ${pending} new message(s) for you. Prompt your agent to read them.`, "info");
             }
           }
+          await refreshWidget(c, me);
         } catch {
           /* watcher is best-effort */
         } finally {
@@ -253,6 +260,38 @@ export default function (pi: ExtensionAPI) {
         }
       }, 250);
     });
+  }
+
+  // -------------------------------------------------------------------------
+  // footer widget + hygiene sweep
+  // -------------------------------------------------------------------------
+
+  let lastWidgetAt = 0;
+  async function refreshWidget(c: ExtensionContext | undefined, me: NonNullable<Awaited<ReturnType<typeof myTeam>>>, force = false) {
+    if (!c?.hasUI) return;
+    const now = Date.now();
+    if (!force && now - lastWidgetAt < 15_000) return;
+    lastWidgetAt = now;
+    try {
+      const [members, tasks, pending] = await Promise.all([
+        bus.loadMembers(me.root, me.team),
+        bus.loadTasks(me.root, me.team),
+        bus.pendingCount(me.root, me.team, me.id),
+      ]);
+      const done = tasks.filter((t: any) => t.status === "done").length;
+      const text = `[team:${me.team}] ${Object.keys(members).length} members · ${pending} msg · ${done}/${tasks.length} tasks done`;
+      c.ui.setStatus("team", text);
+    } catch {
+      /* widget is best-effort */
+    }
+  }
+
+  let lastSweepAt = 0;
+  async function maybeSweep(me: NonNullable<Awaited<ReturnType<typeof myTeam>>>) {
+    const now = Date.now();
+    if (now - lastSweepAt < 60 * 60 * 1000) return;
+    lastSweepAt = now;
+    await bus.sweepTeam(me.root, me.team).catch(() => {});
   }
 
   // -------------------------------------------------------------------------
@@ -266,6 +305,8 @@ export default function (pi: ExtensionAPI) {
     const me = await myTeam(c);
     if (me) {
       startWatcher(me);
+      await maybeSweep(me);
+      await refreshWidget(c, me, true);
       if (c.hasUI) {
         c.ui.notify(`[team:${me.team}] you are ${me.name} (${me.role}).`, "info");
       }
@@ -280,6 +321,11 @@ export default function (pi: ExtensionAPI) {
     if (lastTeam) {
       bus.setMemberStatusSync(lastTeam.root, lastTeam.team, lastTeam.id, "offline");
     }
+    try {
+      ctx?.ui.setStatus("team", "");
+    } catch {
+      /* ignore */
+    }
     lastTeam = undefined;
     ctx = undefined;
   });
@@ -289,6 +335,7 @@ export default function (pi: ExtensionAPI) {
     const me = await myTeam(c);
     if (!me) return;
     await throttledTouch(me);
+    await refreshWidget(c, me);
     const msgs = await bus.drainInbox(me.root, me.team, me.id);
     const members = await bus.loadMembers(me.root, me.team);
     const line = rosterLine(me.team, bus.rosterList(members, me.id));
@@ -343,6 +390,7 @@ export default function (pi: ExtensionAPI) {
     me: NonNullable<Awaited<ReturnType<typeof myTeam>>>,
     p: Record<string, any>,
     to: string,
+    c: ExtensionContext,
   ): Promise<string> {
     const root = p.dir?.trim() || bus.teamsRoot(process.env);
     const tid = String(p.task_id || "").trim();
@@ -351,17 +399,25 @@ export default function (pi: ExtensionAPI) {
       root,
       me.team,
       tid,
-      { status: to, reason: p.body, evidence: p.evidence },
+      { status: to, reason: p.body, evidence: p.evidence, depOverride: p.dep_override },
       { id: me.id, name: me.name, role: me.role },
     );
     if (!res.ok) return `error: ${res.error}`;
     let out = `Task ${tid} -> ${to}.`;
     if (res.warnings?.length) {
-      out += `\nWarning — unfinished dependencies: ${res.warnings.join(", ")}. Address them or note why they are not blocking.`;
+      out += `\nWarning — ${res.warnings.join("; ")}.`;
+    }
+    if (res.bouncedTaskId) {
+      out += `\nTask ${res.bouncedTaskId} was bounced back to running (review failed) and its assignee was notified.`;
+    }
+    if (res.acceptedTaskId) {
+      out += `\nTask ${res.acceptedTaskId} accepted (review passed) and its creator was notified.`;
     }
     if (res.notified) {
       out += ` Notified ${res.notified} recipient(s).`;
     }
+    const me2 = await myTeam(c);
+    if (me2) await refreshWidget(c, me2, true);
     return out;
   }
 
@@ -505,12 +561,17 @@ export default function (pi: ExtensionAPI) {
           criteria,
           dependsOn,
           priority: p.priority,
+          kind: p.kind,
+          reviewOf: p.review_of,
           createdBy: me.id,
           createdByName: me.name,
         });
         if (!res.ok) return `error: ${res.error}`;
-        const notice = res.notified ? ` Notified ${res.notified} assignee(s).` : "";
-        return `Created task ${res.task.id} [${res.task.status}]: ${title}${assignee ? ` -> ${assignee}` : ""}.${notice}`;
+        let out = `Created task ${res.task.id} [${res.task.status}]${res.task.kind === "review" ? " (review)" : ""}: ${title}${assignee ? ` -> ${assignee}` : ""}.`;
+        if (res.notified) out += ` Notified ${res.notified} assignee(s).`;
+        if (res.warnings?.length) out += `\nWarning: ${res.warnings.join("; ")}`;
+        await refreshWidget(c, me, true);
+        return out;
       }
 
       case "task_list": {
@@ -533,13 +594,13 @@ export default function (pi: ExtensionAPI) {
       }
 
       case "task_start":
-        return taskTransition(me, p, "running");
+        return taskTransition(me, p, "running", c);
       case "task_blocked":
-        return taskTransition(me, p, "blocked");
+        return taskTransition(me, p, "blocked", c);
       case "task_fail":
-        return taskTransition(me, p, "failed");
+        return taskTransition(me, p, "failed", c);
       case "task_done":
-        return taskTransition(me, p, "done");
+        return taskTransition(me, p, "done", c);
 
       case "task_assign": {
         if (!me) return notInTeam;
@@ -591,13 +652,14 @@ export default function (pi: ExtensionAPI) {
     name: "team",
     label: "Team",
     description:
-      "Coordinate with other pi agents in your team (like a company): join teams, DM teammates, assign tasks, post reports, share a board, and track a structured task board. Actions: create, join, leave, roster, dm, broadcast, task, report, inbox, board_write, board_read, status, whoami, set_role, spawn, selftest, task_create, task_list, task_show, task_start, task_done, task_blocked, task_fail, task_assign. Address recipients by member name or role:<role> (e.g. role:implementer). Reports go to role:coordinator by default. Tasks live on the team board; completing one REQUIRES evidence.",
+      "Coordinate with other pi agents in your team (like a company): join teams, DM teammates, assign tasks, post reports, share a board, and track a structured task board. Actions: create, join, leave, roster, dm, broadcast, task, report, inbox, board_write, board_read, status, whoami, set_role, spawn, selftest, task_create, task_list, task_show, task_start, task_done, task_blocked, task_fail, task_assign. Address recipients by member name or role:<role> (e.g. role:implementer). Reports go to role:coordinator by default. Tasks live on the team board; completing one REQUIRES evidence, is blocked on unfinished dependencies unless dep_override, and kind=review tasks gate a reviewed task (failure bounces it back to running).",
     promptSnippet: "Coordinate with teammate pi agents via team: DM, assign tasks, post reports, share a board, track tasks",
     promptGuidelines: [
       "Use team when the user wants multiple agents to work together or you need help from a teammate.",
       "Use team task with role:<role> or a member name to assign work; always include a subject and body.",
       "Prefer team task_create for anything with multiple steps: it records the task on the team board with status, acceptance criteria, and evidence. team task is the lightweight DM version.",
-      "Use team task_done with task_id and evidence (what changed, file refs, validation) to complete a board task — evidence is required.",
+      "Use team task_create with kind=review and review_of=<task id> to add an independent review gate: the reviewer passes with task_done --evidence or bounces the work back with task_fail --body '<issues>'.",
+      "Use team task_done with task_id and evidence (what changed, file refs, validation) to complete a board task — evidence is required and unfinished dependencies block completion unless you pass dep_override with a reason.",
       "Use team report to send your completion report to role:coordinator after finishing assigned work.",
       "Use team roster to see teammates and roles; use team inbox to check for new messages mid-turn.",
       "Use team board_write/board_read for shared design notes instead of long DMs.",
@@ -615,6 +677,9 @@ export default function (pi: ExtensionAPI) {
       criteria: Type.Optional(Type.Array(Type.String(), { description: "Acceptance criteria for task_create (array or newline/;-separated text)." })),
       evidence: Type.Optional(Type.String({ description: "Required for task_done: what changed (file refs), validation run." })),
       depends_on: Type.Optional(Type.Array(Type.String(), { description: "Task ids this task depends on (task_create)." })),
+      dep_override: Type.Optional(Type.String({ description: "Reason to complete a task despite unfinished dependencies (task_done)." })),
+      kind: Type.Optional(StringEnum(["work", "review"] as const)),
+      review_of: Type.Optional(Type.String({ description: "For kind=review: the task id being reviewed. Failing the review bounces it back to running." })),
       priority: Type.Optional(StringEnum(["normal", "high"] as const)),
       status: Type.Optional(Type.String({ description: "Status text for the status action (e.g. blocked on parser)." })),
       prompt: Type.Optional(Type.String({ description: "Kickoff prompt for the spawn action." })),
@@ -721,9 +786,17 @@ export default function (pi: ExtensionAPI) {
             if (!tasks.length) return notify("Task board empty.");
             return notify(
               tasks
-                .map((t: any) => `[${t.status}] ${t.id} — ${t.title}${t.assignee ? ` (-> ${t.assignee})` : ""}`)
+                .map((t: any) => `[${t.status}] ${t.id} — ${t.title}${t.kind === "review" ? " (review)" : ""}${t.assignee ? ` (-> ${t.assignee})` : ""}`)
                 .join("\n"),
             );
+          }
+          case "prune": {
+            const me = await myTeam(c);
+            if (!me) return notify("You are not in a team.");
+            const hours = parseFloat(argv.hours || argv._[1] || "24");
+            if (!hours || hours <= 0) return notify("Usage: /team prune [--hours N] (default 24)");
+            const res = await bus.pruneMembers(root, me.team, { olderThanMs: hours * 3_600_000 });
+            return notify(`Pruned ${res.removed} member(s) last seen more than ${hours}h ago.`);
           }
           case "inbox": {
             const me = await myTeam(c);
@@ -773,11 +846,14 @@ export default function (pi: ExtensionAPI) {
               "/team tasks                                   show the task board",
               "/team inbox                                   read pending messages",
               "/team set-role <role> / set-name <name>       update your role/name",
+              "/team prune [--hours N]                       remove members last seen > N h ago (default 24)",
               "/team config                                  show team settings",
               "/team selftest                                run bus self-tests",
               "",
               "Agents coordinate via the team tool: dm, task, report, broadcast, board_write/read,",
-              "task_create/task_list/task_done (board tasks require evidence).",
+              "task_create/task_list/task_done (board tasks require evidence; kind=review adds a",
+              "review gate that bounces failed work back; done is blocked on unfinished deps",
+              "unless dep_override).",
               "Spawn a worker: PI_TEAM=<team> PI_TEAM_ROLE=<role> PI_TEAM_NAME=<name> pi",
             ].join("\n");
             return notify(help);
@@ -939,6 +1015,38 @@ export default function (pi: ExtensionAPI) {
       ok("done with evidence", goodDone.ok && goodDone.task.status === "done" && goodDone.notified === 1);
       const aliceIn = await bus.drainInbox(root, "acme", "sessA");
       ok("creator got task_done notice", aliceIn.some((m) => m.type === "task_done"));
+      // hard dependency gate: done is rejected until deps finish (or dep_override)
+      const dep1 = await bus.createTask(root, "acme", { title: "API spec", createdBy: "sessA", createdByName: "Alice" });
+      const dep2 = await bus.createTask(root, "acme", { title: "implement API", dependsOn: [dep1.task.id], createdBy: "sessA", createdByName: "Alice" });
+      const gated = await bus.updateTask(root, "acme", dep2.task.id, { status: "done", evidence: "done" }, { id: "sessB", name: "Bob", role: "implementer" });
+      ok("done blocked by unfinished dep", !gated.ok && gated.error.includes("dep_override"));
+      const overridden = await bus.updateTask(root, "acme", dep2.task.id, { status: "done", evidence: "done", depOverride: "spec deferred by coordinator" }, { id: "sessB", name: "Bob", role: "implementer" });
+      ok("dep_override accepts", overridden.ok && overridden.warnings.some((w) => w.includes("dep_override")));
+      // review gate: failing the review bounces the work back to running
+      const work = await bus.createTask(root, "acme", { title: "feature X", assignee: "role:implementer", createdBy: "sessA", createdByName: "Alice" });
+      const review = await bus.createTask(root, "acme", { title: "review feature X", kind: "review", reviewOf: work.task.id, assignee: "role:reviewer", createdBy: "sessA", createdByName: "Alice" });
+      ok("review task created", review.ok && review.task.kind === "review" && review.task.reviewOf === work.task.id);
+      const badReview = await bus.createTask(root, "acme", { title: "review missing", kind: "review", reviewOf: "t_nope", createdBy: "sessA", createdByName: "Alice" });
+      ok("review of unknown task rejected", !badReview.ok);
+      await bus.updateTask(root, "acme", work.task.id, { status: "done", evidence: "implemented" }, { id: "sessB", name: "Bob", role: "implementer" });
+      const bounce = await bus.updateTask(root, "acme", review.task.id, { status: "failed", reason: "edge case uncovered" }, { id: "sessC", name: "Carol", role: "reviewer" });
+      ok("review fail bounces work", bounce.ok && bounce.bouncedTaskId === work.task.id);
+      const afterBounce = (await bus.loadTasks(root, "acme")).find((x) => x.id === work.task.id);
+      ok("work back to running", afterBounce.status === "running");
+      const bobIn = await bus.drainInbox(root, "acme", "sessB");
+      ok("implementer notified of bounce", bobIn.some((m) => m.type === "task_bounced"));
+      const pass = await bus.updateTask(root, "acme", review.task.id, { status: "done", evidence: "expiry handled" }, { id: "sessC", name: "Carol", role: "reviewer" });
+      ok("review pass accepts work", pass.ok && pass.acceptedTaskId === work.task.id);
+      // hygiene: prune + sweep + rotation
+      const pruned = await bus.pruneMembers(root, "acme", { olderThanMs: 0 });
+      ok("prune removes stale members", pruned.removed >= 2);
+      const tmpFile = path.join(bus.teamDir(root, "acme"), "inbox", "sessA", "x.tmp-123");
+      fs.mkdirSync(path.dirname(tmpFile), { recursive: true });
+      fs.writeFileSync(tmpFile, "stale");
+      const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+      fs.utimesSync(tmpFile, old, old);
+      await bus.sweepTeam(root, "acme");
+      ok("sweep removes stale tmp files", !fs.existsSync(tmpFile));
       return "SELFTEST: " + log.join(" | ");
     } catch (e: any) {
       return "SELFTEST FAIL: " + (e?.message ?? e) + " | " + log.join(" | ");

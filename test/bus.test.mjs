@@ -197,6 +197,68 @@ const main = async () => {
     ok("all 8 concurrent joins survived", Object.keys(members).length === 8);
   });
 
+  await t("hard dep gate + review bounce + hygiene", async () => {
+    // Rejoin members with the roles this test needs (earlier tests changed/removed them).
+    await bus.joinMember(root, "acme", { id: "sessB", name: "Bob", role: "implementer" });
+    await bus.joinMember(root, "acme", { id: "sessC", name: "Carol", role: "reviewer" });
+    // hard dep gate on done
+    const dep1 = await bus.createTask(root, "acme", { title: "API spec", createdBy: "sessA", createdByName: "Alice" });
+    const dep2 = await bus.createTask(root, "acme", { title: "implement API", dependsOn: [dep1.task.id], createdBy: "sessA", createdByName: "Alice" });
+    const gated = await bus.updateTask(root, "acme", dep2.task.id, { status: "done", evidence: "done" }, { id: "sessB", name: "Bob", role: "implementer" });
+    ok("done blocked by unfinished dep", !gated.ok && gated.error.includes("dep_override"));
+    const overridden = await bus.updateTask(root, "acme", dep2.task.id, { status: "done", evidence: "done", depOverride: "coordinator deferred spec" }, { id: "sessB", name: "Bob", role: "implementer" });
+    ok("dep_override accepts with warning", overridden.ok && overridden.warnings.some((w) => w.includes("dep_override")));
+
+    // review task kind + bounce
+    const work = await bus.createTask(root, "acme", { title: "feature X", assignee: "role:implementer", createdBy: "sessA", createdByName: "Alice" });
+    const review = await bus.createTask(root, "acme", { title: "review feature X", kind: "review", reviewOf: work.task.id, assignee: "role:reviewer", createdBy: "sessA", createdByName: "Alice" });
+    ok("review task created", review.ok && review.task.kind === "review");
+    const badReview = await bus.createTask(root, "acme", { title: "bad", kind: "review", reviewOf: "t_nope", createdBy: "sessA", createdByName: "Alice" });
+    ok("review of unknown task rejected", !badReview.ok);
+    const sameRole = await bus.createTask(root, "acme", { title: "self-review", kind: "review", reviewOf: work.task.id, assignee: "role:implementer", createdBy: "sessA", createdByName: "Alice" });
+    ok("same-role reviewer warns", sameRole.ok && sameRole.warnings.length > 0);
+
+    await bus.updateTask(root, "acme", work.task.id, { status: "done", evidence: "implemented" }, { id: "sessB", name: "Bob", role: "implementer" });
+    const bounce = await bus.updateTask(root, "acme", review.task.id, { status: "failed", reason: "edge case" }, { id: "sessC", name: "Carol", role: "reviewer" });
+    ok("review fail bounces work", bounce.ok && bounce.bouncedTaskId === work.task.id);
+    const tasks = await bus.loadTasks(root, "acme");
+    ok("work back to running", tasks.find((x) => x.id === work.task.id).status === "running");
+    const bobIn = await bus.drainInbox(root, "acme", "sessB");
+    ok("implementer notified of bounce", bobIn.some((m) => m.type === "task_bounced"));
+    // reviewer passes the review while the work is still bounced (running)
+    // -> the work is auto-accepted as done
+    const pass = await bus.updateTask(root, "acme", review.task.id, { status: "done", evidence: "expiry handled; looks good" }, { id: "sessC", name: "Carol", role: "reviewer" });
+    ok("review pass accepts work", pass.ok && pass.acceptedTaskId === work.task.id);
+    const afterPass = (await bus.loadTasks(root, "acme")).find((x) => x.id === work.task.id);
+    ok("work done after review pass", afterPass.status === "done");
+    // blocked escalates to coordinator
+    await bus.createTask(root, "acme", { title: "flaky thing", assignee: "role:implementer", createdBy: "sessA", createdByName: "Alice" });
+    const flaky = (await bus.loadTasks(root, "acme")).find((x) => x.title === "flaky thing");
+    await bus.updateTask(root, "acme", flaky.id, { status: "blocked", reason: "dep missing" }, { id: "sessB", name: "Bob", role: "implementer" });
+    const aliceIn = await bus.drainInbox(root, "acme", "sessA");
+    ok("coordinator notified of blocked", aliceIn.some((m) => m.type === "task_blocked" && m.body.includes("dep missing")));
+
+    // hygiene: prune + sweep stale tmp
+    const pruned = await bus.pruneMembers(root, "acme", { olderThanMs: 0 });
+    ok("prune removes stale members", pruned.removed >= 2);
+    const tmpFile = path.join(bus.teamDir(root, "acme"), "inbox", "sessA", "x.tmp-123");
+    fs.mkdirSync(path.dirname(tmpFile), { recursive: true });
+    fs.writeFileSync(tmpFile, "stale");
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    fs.utimesSync(tmpFile, old, old);
+    await bus.sweepTeam(root, "acme");
+    ok("sweep removes stale tmp files", !fs.existsSync(tmpFile));
+
+    // log rotation (simulate a huge log, then confirm append rotates)
+    const logFile = path.join(bus.teamDir(root, "acme"), "log.jsonl");
+    fs.writeFileSync(logFile, "x".repeat(bus.TEAM_LOG_MAX_BYTES + 1000));
+    await bus.appendTeamLog(root, "acme", { ts: Date.now(), event: "rotation_test" });
+    ok("oversized log rotated", fs.statSync(logFile).size < bus.TEAM_LOG_MAX_BYTES);
+    const rotated = fs.readdirSync(bus.teamDir(root, "acme")).filter((f) => f.startsWith("log.jsonl."));
+    ok("rotated file kept", rotated.length === 1);
+  });
+
+
   console.log(`\nAll bus tests passed (${passed} assertions).`);
   fs.rmSync(root, { recursive: true, force: true });
 };

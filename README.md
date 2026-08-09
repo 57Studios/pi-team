@@ -72,11 +72,11 @@ injected at the start of his next turn, does the work, and sends
 | `team board_write --topic design --body "..."` | share a design note |
 | `team board_read [--topic T]` | read board topics / one topic |
 | `team status --status "blocked on parser"` | update your status |
-| `team task_create --subject T --to Bob\|role:R [--body "..."] [--criteria ...] [--depends_on ...]` | create a board task (notifies assignee) |
+| `team task_create --subject T --to Bob\|role:R [--body "..."] [--criteria ...] [--depends_on ...] [--kind work\|review] [--review_of T]` | create a board task (notifies assignee) |
 | `team task_list` / `team task_show --task_id T` | view the board / one task |
 | `team task_start --task_id T` | claim/start a task |
-| `team task_done --task_id T --evidence "..."` | complete a task (**evidence required**) |
-| `team task_blocked --task_id T --body "reason"` / `task_fail` | report blockers/failure |
+| `team task_done --task_id T --evidence "..." [--dep_override "reason"]` | complete a task (**evidence required**; blocked on unfinished deps unless overridden) |
+| `team task_blocked --task_id T --body "reason"` / `task_fail` | report blockers/failure (escalates to coordinator) |
 | `team task_assign --task_id T --to name\|role:R` | reassign (creator/coordinator only) |
 | `team spawn --role implementer --name Dave [--prompt "..."]` | open a new terminal running pi, pre-joined |
 | `team create/join/leave/set_role/whoami` | team lifecycle |
@@ -96,14 +96,21 @@ their "typed artifacts on a DAG" without an engine:
 - **Evidence is enforced**: `task_done` without evidence is rejected. The
   agent must say what changed (file refs) and what validation it ran — a bare
   "done" is structurally impossible, like jcode's gate on artifacts.
-- **Dependency warnings**: starting/completing a task whose `depends_on`
-  aren't done returns an explicit warning (jcode turns these into new nodes;
-  pi-team surfaces them for the agent to address or justify).
-- **Notifications are atomic with transitions**: creating a task DMs the
-  assignee; completing one DMs the creator. No missed handoffs.
+- **Hard dependency gate**: `task_done` is *rejected* while any `depends_on`
+  is unfinished, unless the agent passes `dep_override` with a reason —
+  jcode's "parent cannot close with open gaps," with an escape hatch.
+- **Review tasks** (`--kind review --review_of <task id>`): an independent
+  reviewer (different role/name) passes with evidence, or **bounces the work**
+  — failing the review flips the reviewed task back to `running` and notifies
+  its implementer; passing it (while bounced) accepts the work as done.
+  This is jcode's critique gate, made concrete.
+- **Escalation is automatic**: blocked/failed tasks notify the coordinator
+  (fallback: the creator); completed tasks notify the creator; bounces notify
+  the implementer. Notifications are atomic with the transition — no missed
+  handoffs.
 - **Permissions are light and social**: assignee/role/coordinator can change
   status; unassigned tasks are claimable by anyone; only creator/coordinator
-  can reassign.
+  can reassign; a same-role reviewer gets a warning.
 - Everyone sees the whole board (`team task_list`, `/team tasks`), so the
   coordinator can review evidence and push back — the social layer of
   jcode's critique gate.
@@ -118,9 +125,28 @@ their "typed artifacts on a DAG" without an engine:
 /team tasks                                    show the task board
 /team inbox                                    read pending messages
 /team set-role <role>   /team set-name <name>  change your role/name
+/team prune [--hours N]                             remove members last seen > N h ago (default 24)
 /team config                                   team settings (autoRespond, interject)
 /team selftest                                 run the built-in self tests
 ```
+
+## Housekeeping (automatic + on demand)
+
+Storage can't grow unboundedly:
+
+- **Log rotation**: `log.jsonl` rotates at 5 MB (`TEAM_LOG_MAX_BYTES`),
+  keeping the last 3 rotated files.
+- **Temp-file sweep**: stale `*.tmp-*` files (from a killed writer) older
+  than 1h are removed automatically.
+- **Dead-member pruning**: members last seen > 7 days ago are pruned
+automatically; run `/team prune [--hours N]` to sweep sooner (default 24h).
+- The sweep runs ~1/hour per instance while in a team (throttled, cheap).
+
+## UI
+
+A footer status shows `[team:name] N members · M msg · X/Y tasks done`,
+updated on join/leave, new mail, and task transitions (refreshed at most
+once per 15s). Teammates see you as `offline` after you close pi.
 
 ## Roles & hierarchy
 
@@ -199,11 +225,12 @@ Edit `~/.pi/teams/<team>/team.json`:
 | server-owned member registry | shared filesystem registry (no server) |
 | soft-interrupt DM injection | `before_agent_start` + watcher steer-injection |
 | coordinator owns a `VersionedPlan` | coordinator role is social; tasks are structured board items |
-| DAG engine: gates, typed artifacts, acyclicity | task board: status machine, required evidence, dependency warnings |
+| DAG engine: gates, typed artifacts, acyclicity | task board: review tasks, required evidence, hard dep gate, dependency warnings |
+| critique gate converts gaps into nodes | review tasks bounce failed work back; blocked/failed escalates to coordinator |
 | worktree managers, git worktrees | shared repo, optimistic file edits |
-| 1000-member cap, RAM budget | no hard cap (practical limit = filesystem) |
+| 1000-member cap, RAM budget | no hard cap (practical limit = filesystem); log rotation + pruning keep storage bounded |
 
 Like jcode, coordination is **explicit and optimistic**: no locks on files,
 agents resolve conflicts by DMing each other. The task board borrows jcode's
-core lesson — evidence is enforced, gaps surface as warnings — without the
-engine.
+core lesson — evidence is enforced, gaps surface as bounces/warnings —
+without the engine.
