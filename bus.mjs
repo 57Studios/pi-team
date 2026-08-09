@@ -684,6 +684,30 @@ export function rosterList(members, selfId) {
 
 // Resolve a "to" address: a member name, or role:<role> for every member with
 // that role (excluding the sender).
+// Cross-team comm is LEAD-TO-LEAD: the sender must be a coordinator of their
+// team (Hub/Boss/Lead aliases count) and every resolved target must be a
+// coordinator of the target team. Boards/tasks stay per-team.
+export function crossTeamCheck(senderRole, targetMembers, targetIds) {
+  if (!hasRole(senderRole, "coordinator")) {
+    return {
+      ok: false,
+      error:
+        "cross-team comm is lead-only: you must be a coordinator (Hub/Boss/Lead) of your own team to DM another team. Ask your coordinator to relay.",
+    };
+  }
+  const nonLeads = targetIds
+    .map((id) => targetMembers[id])
+    .filter((m) => m && !hasRole(m.role, "coordinator"))
+    .map((m) => m.name);
+  if (nonLeads.length) {
+    return {
+      ok: false,
+      error: `cross-team comm is lead-to-lead: ${nonLeads.join(", ")} is not a coordinator of the target team. Talk to that team's coordinator instead.`,
+    };
+  }
+  return { ok: true };
+}
+
 // Resolve a cross-team address "TeamName/MemberName" or "TeamName/role:role".
 // Returns the resolved team + members + ids, or { error }.
 export async function resolveCrossTarget(root, to) {

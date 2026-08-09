@@ -217,7 +217,7 @@ export default function (pi: ExtensionAPI) {
         "- Status checks are NON-BLOCKING: use team checkin (wake-DMs everyone, then END YOUR TURN). Replies auto-wake you one at a time with progress; never sleep or poll the inbox waiting for replies.",
         "- To be woken by the harness later (e.g. check back in 30 min), set a timer: team later --minutes 30 --body \"...\" (or --at HH:MM). The harness pings you with a turn when it fires; timers survive restarts.",
         "- Web search is built in: team search \"query\" (SearXNG on localhost — no API key; use --categories news for news). Scout/research work: search first, then verify the top hits before citing.",
-        "- Cross-team: you can DM (or report to) a member of ANOTHER team with to='TeamName/MemberName' or 'TeamName/role:role', e.g. team dm to:'Zilla/Zed' --body \"...\". Replies route back; both teams' audit logs record it. Cross-team is for dm/report only.",
+        "- Cross-team comm is LEAD-TO-LEAD: only coordinators (Hub/Boss/Lead) may DM another team, and only to that team's coordinator — team dm to:'Zilla/Zed' or to:'Zilla/role:coordinator'. Non-leads asking for cross-team coordination should ask their own coordinator to relay. dm/report only; boards and tasks stay per-team.",
       );
       if (researchers.length) {
         lines.push(
@@ -937,6 +937,9 @@ export default function (pi: ExtensionAPI) {
           const cross = String(to || "").includes("/") ? await bus.resolveCrossTarget(root, to) : null;
           if (cross && cross.error) return `error: ${cross.error}`;
           if (cross) {
+            // Lead-to-lead policy: sender + every target must be a coordinator.
+            const policy = bus.crossTeamCheck(me.role, cross.members, cross.ids);
+            if (!policy.ok) return `error: ${policy.error}`;
             targets = cross.ids;
             toLabel = `${cross.names.join(", ")} (${cross.team})`;
             // cross-team sends land in BOTH audit logs so the reply rule

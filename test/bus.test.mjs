@@ -559,6 +559,64 @@ const main = async () => {
     fs.rmSync(root2, { recursive: true, force: true });
   });
 
+  await t("cross-team lead-to-lead policy", async () => {
+    const root2 = path.join(root, "leads");
+    await bus.createTeam(root2, "Alpha", {});
+    await bus.createTeam(root2, "Zilla", {});
+    await bus.joinMember(root2, "Alpha", { id: "a1", name: "Optimus", role: "coordinator" });
+    await bus.joinMember(root2, "Alpha", { id: "a2", name: "Carol", role: "implementer" });
+    await bus.joinMember(root2, "Zilla", { id: "z1", name: "Zed", role: "Hub" });
+    await bus.joinMember(root2, "Zilla", { id: "z2", name: "Mint", role: "Math" });
+    const zMembers = await bus.loadMembers(root2, "Zilla");
+    // lead sender -> lead target: allowed
+    const r1 = await bus.resolveCrossTarget(root2, "Zilla/Zed");
+    ok("lead-to-lead allowed", bus.crossTeamCheck("coordinator", zMembers, r1.ids).ok === true);
+    const r2 = await bus.resolveCrossTarget(root2, "Zilla/role:coordinator");
+    ok("role:coordinator target allowed", bus.crossTeamCheck("Hub", zMembers, r2.ids).ok === true);
+    // non-lead sender blocked
+    const blocked1 = bus.crossTeamCheck("implementer", zMembers, r1.ids);
+    ok("non-lead sender blocked", !blocked1.ok && blocked1.error.includes("lead-only"));
+    const blocked2 = bus.crossTeamCheck("Math", zMembers, r1.ids);
+    ok("non-lead alias sender blocked", !blocked2.ok);
+    // lead sender -> non-lead target blocked
+    const r3 = await bus.resolveCrossTarget(root2, "Zilla/Mint");
+    const blocked3 = bus.crossTeamCheck("coordinator", zMembers, r3.ids);
+    ok("non-lead target blocked", !blocked3.ok && blocked3.error.includes("Mint"));
+    // mixed targets (coordinator + non) blocked
+    const blocked4 = bus.crossTeamCheck("coordinator", zMembers, [...r1.ids, ...r3.ids]);
+    ok("mixed targets blocked", !blocked4.ok);
+    fs.rmSync(root2, { recursive: true, force: true });
+  });
+
+  await t("cross-team handler sequence (resolve -> policy -> send) end-to-end", async () => {
+    const root2 = path.join(root, "xend");
+    await bus.createTeam(root2, "LeadA", {});
+    await bus.createTeam(root2, "LeadB", {});
+    await bus.joinMember(root2, "LeadB", { id: "lb1", name: "Zed", role: "Hub" });
+    await bus.joinMember(root2, "LeadB", { id: "lb2", name: "Mint", role: "Math" });
+    const zMembers = await bus.loadMembers(root2, "LeadB");
+    // CASE 1: Optimus (coordinator) -> LeadB/Zed: allowed, delivered
+    const c1 = await bus.resolveCrossTarget(root2, "LeadB/Zed");
+    const p1 = bus.crossTeamCheck("coordinator", zMembers, c1.ids);
+    ok("case1 policy ok", p1.ok);
+    const s1 = await bus.sendMessage(root2, "LeadB", {
+      type: "dm", from: "a1", fromName: "Optimus", fromRole: "coordinator", fromTeam: "LeadA",
+      to: "Zed", body: "coordinate", wake: true, targets: c1.ids,
+    }, { members: zMembers, logTeams: ["LeadB", "LeadA"] });
+    ok("case1 delivered", s1.ok && (await bus.drainInbox(root2, "LeadB", "lb1")).length === 1);
+    // CASE 2: Optimus -> LeadB/Mint: policy blocks (Mint not a lead)
+    const c2 = await bus.resolveCrossTarget(root2, "LeadB/Mint");
+    const p2 = bus.crossTeamCheck("coordinator", zMembers, c2.ids);
+    ok("case2 blocked: non-lead target", !p2.ok && p2.error.includes("Mint"));
+    // CASE 3: Carol (implementer) -> LeadB/Zed: policy blocks (sender not a lead)
+    const p3 = bus.crossTeamCheck("implementer", zMembers, c1.ids);
+    ok("case3 blocked: non-lead sender", !p3.ok && p3.error.includes("lead-only"));
+    // CASE 4: role target resolves to the lead and passes
+    const c4 = await bus.resolveCrossTarget(root2, "LeadB/role:coordinator");
+    ok("case4 role target ok", bus.crossTeamCheck("Hub", zMembers, c4.ids).ok === true);
+    fs.rmSync(root2, { recursive: true, force: true });
+  });
+
   await t("project memory (MEMORY.md)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memo-"));
     // first append seeds the header
