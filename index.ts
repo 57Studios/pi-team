@@ -35,7 +35,7 @@ const ACTIONS = [
   "inbox", "board_write", "board_read", "status", "whoami", "set_role",
   "spawn", "selftest",
   "task_create", "task_list", "task_show", "task_start", "task_done", "task_blocked", "task_fail", "task_assign",
-  "preset_show", "preset_save", "preset_create", "revive", "briefing", "memo", "config", "await_members", "kick", "checkin",
+  "preset_show", "preset_save", "preset_create", "revive", "briefing", "memo", "config", "await_members", "kick", "checkin", "later", "timers",
 ] as const;
 
 const TEAM_IDENTITY_ENTRY = "team-identity";
@@ -215,6 +215,7 @@ export default function (pi: ExtensionAPI) {
       lines.push(
         "- Idle members auto-start a turn when you DM/broadcast them (rate-limited ~3/min) — messages are read automatically, no one needs to prompt them. For an urgent immediate turn, mark the message wake: team dm --wake.",
         "- Status checks are NON-BLOCKING: use team checkin (wake-DMs everyone, then END YOUR TURN). Replies auto-wake you one at a time with progress; never sleep or poll the inbox waiting for replies.",
+        "- To be woken by the harness later (e.g. check back in 30 min), set a timer: team later --minutes 30 --body \"...\" (or --at HH:MM). The harness pings you with a turn when it fires; timers survive restarts.",
       );
       if (researchers.length) {
         lines.push(
@@ -271,6 +272,39 @@ export default function (pi: ExtensionAPI) {
     if (now - lastTouchAt < 30_000) return;
     lastTouchAt = now;
     await bus.touchMember(me.root, me.team, me.id).catch(() => {});
+  }
+
+  // Arm persisted self-ping timers: due ones fire now (missed while offline),
+  // future ones schedule a wake. Called on session_start after joining.
+  const pendingTimerTimeouts: NodeJS.Timeout[] = [];
+  async function armTimers(me: NonNullable<Awaited<ReturnType<typeof myTeam>>>) {
+    for (const t of pendingTimerTimeouts) clearTimeout(t);
+    pendingTimerTimeouts.length = 0;
+    const fire = (t: any) => {
+      const c = ctx;
+      if (!c) return;
+      const content = `[scheduled ping] ${t.body || "(no note)"}`;
+      if (c.hasUI) c.ui.notify(`[team:${me.team}] ⏰ timer fired: ${t.body || "ping"}`, "info");
+      pi.sendMessage(
+        { customType: "team-briefing", content, display: true },
+        { triggerTurn: true, deliverAs: "followUp" },
+      );
+    };
+    try {
+      const due = await bus.claimDueTimers(me.root, me.team, me.id);
+      for (const t of due) fire(t);
+      const future = await bus.listTimers(me.root, me.team, me.id);
+      for (const t of future) {
+        const wait = Math.max(1000, t.dueAt - Date.now());
+        const to = setTimeout(async () => {
+          try {
+            const claimed = await bus.claimDueTimers(me.root, me.team, me.id, t.dueAt + 1);
+            for (const ct of claimed) fire(ct);
+          } catch { /* best effort */ }
+        }, wait);
+        pendingTimerTimeouts.push(to);
+      }
+    } catch { /* best effort */ }
   }
 
   function stopWatcher() {
@@ -569,6 +603,7 @@ export default function (pi: ExtensionAPI) {
     const me = await myTeam(c);
     if (me) {
       startWatcher(me);
+      await armTimers(me);
       applyTitle(c, me);
       await seedMemo(c, me);
       await maybeSweep(me);
@@ -1042,6 +1077,28 @@ export default function (pi: ExtensionAPI) {
         return buildBriefing(me, members, brief);
       }
 
+      case "later": {
+        if (!me) return notInTeam;
+        const res = await bus.setTimer(root, me.team, me.id, {
+          minutes: p.minutes,
+          at: String(p.at || "").trim() || undefined,
+          body: String(p.body || "").trim(),
+        });
+        if (!res.ok) return `error: ${res.error}`;
+        const d = new Date(res.timer.dueAt);
+        await armTimers(me);
+        return `Timer set: the harness will ping you at ${d.toTimeString().slice(0, 5)} (in ${Math.max(1, Math.round((res.timer.dueAt - Date.now()) / 60000))} min) — "${res.timer.body || "ping"}". Continue your current work; you will be woken.`;
+      }
+
+      case "timers": {
+        if (!me) return notInTeam;
+        const list = await bus.listTimers(root, me.team, me.id);
+        if (!list.length) return "No timers set. Use team later --minutes N --body \"...\" to have the harness ping you.";
+        return list
+          .map((t: any) => `${t.id} @ ${new Date(t.dueAt).toTimeString().slice(0, 5)} — ${t.body || "(no note)"}`)
+          .join("\n");
+      }
+
       case "checkin": {
         if (!me) return notInTeam;
         return await checkinMembers(me, { to: String(p.to || ""), body: String(p.body || "") });
@@ -1143,7 +1200,7 @@ export default function (pi: ExtensionAPI) {
     name: "team",
     label: "Team",
     description:
-      "Coordinate with other pi agents in your team (like a company): join teams, DM teammates, assign tasks, post reports, share a board, and track a structured task board. Actions: create, join, leave, roster, dm, broadcast, task, report, inbox, board_write, board_read, status, whoami, set_role, spawn, selftest, task_create, task_list, task_show, task_start, task_done, task_blocked, task_fail, task_assign, preset_show, preset_save, preset_create, revive, briefing (read, or set the team mission as coordinator), memo (append to MEMORY.md project memory in the working directory), checkin (NON-BLOCKING status check: wake-DM everyone and end your turn — replies auto-wake you with progress, no sleeping/polling; use this for any 'what is everyone doing' question), await_members (BLOCKING wait: pass ALL member names at once comma-separated to wait until every one replies or the timeout — never call it once per member). Address recipients by member name or role:<role> (e.g. role:implementer). Reports go to role:coordinator by default. Tasks live on the team board; completing one REQUIRES evidence, is blocked on unfinished dependencies unless dep_override, and kind=review tasks gate a reviewed task (failure bounces it back to running).",
+      "Coordinate with other pi agents in your team (like a company): join teams, DM teammates, assign tasks, post reports, share a board, and track a structured task board. Actions: create, join, leave, roster, dm, broadcast, task, report, inbox, board_write, board_read, status, whoami, set_role, spawn, selftest, task_create, task_list, task_show, task_start, task_done, task_blocked, task_fail, task_assign, preset_show, preset_save, preset_create, revive, briefing (read, or set the team mission as coordinator), memo (append to MEMORY.md project memory in the working directory), checkin (NON-BLOCKING status check: wake-DM everyone and end your turn — replies auto-wake you with progress, no sleeping/polling; use this for any 'what is everyone doing' question), await_members (BLOCKING wait: pass ALL member names at once comma-separated to wait until every one replies or the timeout — never call it once per member), later (set a self-ping timer: the harness wakes you with a turn at the given time — team later --minutes 30 --body '...' or --at HH:MM; timers persist across restarts and fire on next start if missed; list with team timers, cancel with team later --cancel <id>). Address recipients by member name or role:<role> (e.g. role:implementer). Reports go to role:coordinator by default. Tasks live on the team board; completing one REQUIRES evidence, is blocked on unfinished dependencies unless dep_override, and kind=review tasks gate a reviewed task (failure bounces it back to running).",
     promptSnippet: "Coordinate with teammate pi agents via team: DM, assign tasks, post reports, share a board, track tasks",
     promptGuidelines: [
       "Use team when the user wants multiple agents to work together or you need help from a teammate.",
@@ -1182,6 +1239,9 @@ export default function (pi: ExtensionAPI) {
       prompt: Type.Optional(Type.String({ description: "Kickoff prompt for the spawn action." })),
       wake: Type.Optional(Type.Boolean({ description: "Wake the recipient(s) on dm/broadcast/task/report: an idle member starts a turn to act on it now (rate-limited). Use for urgent or status-check messages." })),
       auto_respond: Type.Optional(Type.Boolean({ description: "For config: set team autoRespond (coordinator only)." })),
+      minutes: Type.Optional(Type.Number({ description: "For later: ping me in this many minutes." })),
+      at: Type.Optional(Type.String({ description: "For later: ping me at this 24h time (HH:MM, e.g. 14:30)." })),
+      cancel: Type.Optional(Type.String({ description: "For later: cancel a timer by id." })),
       timeout_minutes: Type.Optional(Type.Number({ description: "For await_members: max minutes to wait (1-30, default 3)." })),
       mode: Type.Optional(StringEnum(["all", "any"] as const)),
       preset: Type.Optional(Type.Array(Type.Object({ name: Type.String(), role: Type.Optional(Type.String()) }), { description: "For preset_create: the roster, e.g. [{name:'Optimus', role:'coordinator, reviewer'}, ...]. Roles may be comma-separated." })),
@@ -1287,6 +1347,34 @@ export default function (pi: ExtensionAPI) {
             const res = await bus.kickMember(root, me.team, name, { byId: me.id, byName: me.name, reason });
             if (!res.ok) return notify(`error: ${res.error}`);
             return notify(`Removed ${res.member.name} (${res.member.role}) from "${me.team}". Name is free again.`);
+          }
+          case "later": {
+            const me = await myTeam(c);
+            if (!me) return notify("You are not in a team.");
+            if (argv.cancel) {
+              const res = await bus.cancelTimer(root, me.team, me.id, argv.cancel);
+              return notify(res.ok ? `Cancelled timer ${argv.cancel}.` : `error: ${res.error}`);
+            }
+            const mins = parseFloat(argv.minutes || argv._[1] || "");
+            const body = argv.body || argv._.slice(2).join(" ") || "";
+            const res = await bus.setTimer(root, me.team, me.id, {
+              minutes: Number.isFinite(mins) ? mins : undefined,
+              at: argv.at || undefined,
+              body,
+            });
+            if (!res.ok) return notify(`error: ${res.error}`);
+            await armTimers(me);
+            return notify(`Timer set: ping at ${new Date(res.timer.dueAt).toTimeString().slice(0, 5)} — "${res.timer.body || "ping"}". The harness will wake you.`);
+          }
+          case "timers": {
+            const me = await myTeam(c);
+            if (!me) return notify("You are not in a team.");
+            const list = await bus.listTimers(root, me.team, me.id);
+            return notify(
+              list.length
+                ? list.map((t: any) => `${t.id} @ ${new Date(t.dueAt).toTimeString().slice(0, 5)} — ${t.body || ""}`).join("\n")
+                : "No timers set. Use /team later <minutes> --body \"...\" to have the harness ping you.",
+            );
           }
           case "checkin": {
             const me = await myTeam(c);
@@ -1483,6 +1571,8 @@ export default function (pi: ExtensionAPI) {
               "/team prune [--hours N]                       remove dead members (0 = dead only, default 24h)",
               "/team kick <name> [reason]                  coordinator: remove a member from the team",
               "/team memo <text>                            append to MEMORY.md in this directory (project memory)",
+              "/team later <min> [--body Q] [--at HH:MM]   set a self-ping timer (harness wakes you; --cancel <id> to remove)",
+              "/team timers                               list your timers",
               "/team checkin [names...] [--body Q]       non-blocking status check (replies auto-wake you)",
               "/team await <names...> [--minutes N]       BLOCKING: wait for ALL named members to reply (one call, all at once)",
               "/team briefing [--body \"...\"]               read / set the team mission (coordinator can set)",

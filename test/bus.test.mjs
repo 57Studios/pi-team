@@ -461,6 +461,35 @@ const main = async () => {
     fs.rmSync(root2, { recursive: true, force: true });
   });
 
+  await t("self-ping timers (team later)", async () => {
+    const root2 = path.join(root, "tms");
+    await bus.createTeam(root2, "t", {});
+    await bus.joinMember(root2, "t", { id: "a", name: "Alice", role: "coordinator" });
+    // minutes-based
+    const r1 = await bus.setTimer(root2, "t", "a", { minutes: 30, body: "check market" });
+    ok("minutes timer set", r1.ok && r1.timer.body === "check market" && r1.timer.dueAt > Date.now() + 29 * 60 * 1000);
+    // at-based (HH:MM): next occurrence
+    const d = new Date(Date.now() + 3600 * 1000);
+    const hh = d.getHours(), mm = d.getMinutes();
+    const r2 = await bus.setTimer(root2, "t", "a", { at: `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`, body: "hourly" });
+    ok("at timer set ~1h out", r2.ok && Math.abs(r2.timer.dueAt - (Date.now() + 3600 * 1000)) < 90 * 1000);
+    // errors
+    ok("bad time rejected", !(await bus.setTimer(root2, "t", "a", { at: "25:99" })).ok);
+    ok("bad minutes rejected", !(await bus.setTimer(root2, "t", "a", { minutes: -5 })).ok);
+    // list + cancel
+    const list = await bus.listTimers(root2, "t", "a");
+    ok("list has 2 timers", list.length === 2);
+    ok("cancel works", (await bus.cancelTimer(root2, "t", "a", list[0].id)).ok);
+    ok("cancel unknown errors", !(await bus.cancelTimer(root2, "t", "a", "nope")).ok);
+    // claim: due timers claimed+removed, future ones stay
+    await bus.setTimer(root2, "t", "a", { minutes: -1 === -1 ? 0.00001 : 1, body: "due now" });
+    const due = await bus.claimDueTimers(root2, "t", "a", Date.now() + 1000);
+    ok("due timer claimed", due.length === 1 && due[0].body === "due now");
+    ok("claimed timer removed", (await bus.listTimers(root2, "t", "a")).length === 1);
+    ok("future timers not claimed", (await bus.claimDueTimers(root2, "t", "a", Date.now())).length === 0);
+    fs.rmSync(root2, { recursive: true, force: true });
+  });
+
   await t("project memory (MEMORY.md)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memo-"));
     // first append seeds the header

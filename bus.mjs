@@ -355,6 +355,83 @@ export async function joinMember(root, team, { id, name, role, rejoin = false })
 // Coordinator action: remove a specific member by name (from the roster and
 // the preset). Frees their name; their own sessions may rejoin later (that is
 // a roster change the coordinator sees). Notifies the kicked member.
+// ---- self-ping timers: 'wake me at <time>' for one member -------------------
+// Persisted in the team dir so a restart re-arms them: a timer due while the
+// member was offline fires on the next session start.
+
+function timersFile(root, team) {
+  return path.join(teamDir(root, team), "timers.json");
+}
+
+async function readTimers(root, team) {
+  try {
+    return JSON.parse(await fs.promises.readFile(timersFile(root, team), "utf8")) || {};
+  } catch {
+    return {};
+  }
+}
+
+async function writeTimers(root, team, all) {
+  await fs.promises.mkdir(teamDir(root, team), { recursive: true });
+  await writeJsonAtomic(timersFile(root, team), all);
+}
+
+export async function setTimer(root, team, memberId, { minutes, at, body }) {
+  const now = Date.now();
+  let dueAt = null;
+  if (at) {
+    const m = String(at).match(/^(\d{1,2}):(\d{2})$/);
+    if (!m) return { ok: false, error: `bad time "${at}" (use HH:MM)` };
+    const h = Number(m[1]);
+    const min = Number(m[2]);
+    if (h > 23 || min > 59) return { ok: false, error: `bad time "${at}" (HH:MM)` };
+    const d = new Date(now);
+    d.setHours(h, min, 0, 0);
+    dueAt = d.getTime();
+    if (dueAt <= now) dueAt += 24 * 60 * 60 * 1000; // next occurrence
+  } else {
+    const mins = Number(minutes ?? 30);
+    if (!Number.isFinite(mins) || mins <= 0) return { ok: false, error: "minutes must be > 0" };
+    dueAt = now + mins * 60 * 1000;
+  }
+  const all = await readTimers(root, team);
+  const timers = (all[memberId] ||= []);
+  const t = { id: `t_${Date.now()}_${randomUUID().slice(0, 4)}`, dueAt, body: String(body || "").slice(0, 500), createdAt: now };
+  timers.push(t);
+  timers.sort((a, b) => a.dueAt - b.dueAt);
+  await writeTimers(root, team, all);
+  await appendTeamLog(root, team, { ts: now, event: "timer_set", id: t.id, name: memberId, dueAt, body: t.body });
+  return { ok: true, timer: t };
+}
+
+export async function listTimers(root, team, memberId) {
+  const all = await readTimers(root, team);
+  return (all[memberId] || []).slice();
+}
+
+export async function cancelTimer(root, team, memberId, id) {
+  const all = await readTimers(root, team);
+  const timers = all[memberId] || [];
+  const idx = timers.findIndex((t) => t.id === id);
+  if (idx < 0) return { ok: false, error: `no timer "${id}"` };
+  timers.splice(idx, 1);
+  await writeTimers(root, team, all);
+  await appendTeamLog(root, team, { ts: Date.now(), event: "timer_cancel", id, name: memberId });
+  return { ok: true };
+}
+
+// Atomically claim timers due at/before `now` (removes them so a restart
+// cannot double-fire). Returns the claimed timers.
+export async function claimDueTimers(root, team, memberId, now = Date.now()) {
+  const all = await readTimers(root, team);
+  const timers = all[memberId] || [];
+  const due = timers.filter((t) => t.dueAt <= now);
+  if (!due.length) return [];
+  all[memberId] = timers.filter((t) => t.dueAt > now);
+  await writeTimers(root, team, all);
+  return due;
+}
+
 // ---- checkin records: non-blocking status checks -------------------------
 // The coordinator sends wake DMs and ends its turn; replies auto-wake it and
 // the watcher records progress here so the coordinator never has to block or

@@ -110,6 +110,10 @@ with other harnesses' root-level `MEMORY.md` / `AGENTS.md` conventions:
 - **New DM while mid-turn** → injected before the agent's next LLM call
   (soft interrupt, like jcode).
 - Agents can also check anytime with `team inbox` (via the `team` tool).
+- **`team later --minutes 30 --body "..."`** (or `/team later 30 "..."`,
+  `--at HH:MM`, `/team timers`, `/team later --cancel <id>`) — the model asks
+  the harness to ping it: a persisted timer fires a wake turn at the due time
+  (survives restarts; a missed timer fires on the next session start).
 - **`team checkin`** (or `/team checkin [names...] [--body Q]`) — the
   **non-blocking** status check: wake-DMs everyone, you END YOUR TURN, and
   each reply auto-wakes you with injected progress (`[team-checkin] 2/5
