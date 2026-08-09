@@ -126,6 +126,12 @@ with other harnesses' root-level `MEMORY.md` / `AGENTS.md` conventions:
   next cycle;Daisy:30:scout scan"`, coordinator-only) — auto-armed at each
   member's session start and re-armed after every fire, so a recurring cadence
   (Zilla's 15-min cycle, 30-min scout scan) runs with zero model cooperation.
+- **`team search "query"`** (or `/team search <q> [--count N] [--categories
+  news]`) — web search via the **local SearXNG** instance, no API key, and
+  available to **every team** out of the box: URL resolves from team.json
+  `searchUrl` → `PI_TEAM_SEARXNG_URL` → `SEARXNG_URL` → `JCODE_SEARXNG_URL`
+  → `http://127.0.0.1:8888`. Per-team override:
+  `/team config --search-url <url>` (coordinator).
 - **`team checkin`** (or `/team checkin [names...] [--body Q]`) — the
   **non-blocking** status check: wake-DMs everyone, you END YOUR TURN, and
   each reply auto-wakes you with injected progress (`[team-checkin] 2/5
