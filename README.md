@@ -94,6 +94,12 @@ with other harnesses' root-level `MEMORY.md` / `AGENTS.md` conventions:
   claim it woke people it didn't. Task assignments and task-event
   notifications (done/blocked/failed/bounced/low-confidence) always wake; so
   does `team report`.
+- **Replies always wake — airtight.** A DM back to someone who recently
+  messaged you (or broadcast to you) is detected as a reply from the audit
+  log — stateless, restart-safe — and **forces wake even if the model never
+  passes `--wake`**. A stranded late reply (like the Alpha check-in's Bee) is
+  now impossible: the recipient's pi starts a turn the moment the reply
+  lands. Explicit `--reply-to` also forces wake.
 - **`/team config --auto-respond on|off`** (coordinator) → idle members
   auto-start a turn whenever a DM arrives (rate-limited). Default off to avoid
   surprise turns and ping-pong loops.

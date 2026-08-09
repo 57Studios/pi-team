@@ -333,6 +333,37 @@ const main = async () => {
     fs.rmSync(root2, { recursive: true, force: true });
   });
 
+  await t("airtight reply wake", async () => {
+    const root2 = path.join(root, "reply");
+    await bus.createTeam(root2, "r", {});
+    await bus.joinMember(root2, "r", { id: "a", name: "Alice", role: "coordinator" });
+    await bus.joinMember(root2, "r", { id: "b", name: "Bob", role: "implementer" });
+    // no prior contact -> no auto-wake
+    const first = await bus.sendMessage(root2, "r", { type: "dm", from: "a", fromName: "Alice", fromRole: "coordinator", to: "Bob", body: "hi", targets: ["b"] });
+    ok("fresh dm not auto-wake", first.wake === false);
+    await bus.drainInbox(root2, "r", "b");
+    // Bob replies to Alice WITHOUT passing wake -> must auto-wake (reply rule)
+    const reply = await bus.sendMessage(root2, "r", { type: "dm", from: "b", fromName: "Bob", fromRole: "implementer", to: "Alice", body: "here", targets: ["a"] });
+    ok("reply auto-wakes even without wake flag", reply.wake === true && reply.isReply === true);
+    await bus.drainInbox(root2, "r", "a");
+    // reply to a broadcast also wakes
+    await bus.sendMessage(root2, "r", { type: "broadcast", from: "a", fromName: "Alice", fromRole: "coordinator", to: "everyone", body: "standup", targets: ["b"] });
+    await bus.drainInbox(root2, "r", "b");
+    const br = await bus.sendMessage(root2, "r", { type: "dm", from: "b", fromName: "Bob", fromRole: "implementer", to: "Alice", body: "re: standup", targets: ["a"] });
+    ok("reply to broadcast auto-wakes", br.wake === true);
+    await bus.drainInbox(root2, "r", "a");
+    // explicit replyTo also wakes
+    const rt = await bus.sendMessage(root2, "r", { type: "dm", from: "a", fromName: "Alice", fromRole: "coordinator", to: "Bob", body: "thanks", replyTo: "msg_x", targets: ["b"] });
+    ok("explicit replyTo wakes", rt.wake === true);
+    // role: target does not reply-detect (no single person)
+    const roleSend = await bus.sendMessage(root2, "r", { type: "dm", from: "a", fromName: "Alice", fromRole: "coordinator", to: "role:implementer", body: "all hands", targets: ["b"] });
+    ok("role: target not auto-wake via reply rule", roleSend.wake === false && roleSend.isReply === false);
+    // reply rule survives a restart (stateless: it reads the audit log)
+    const again = await bus.sendMessage(root2, "r", { type: "dm", from: "b", fromName: "Bob", fromRole: "implementer", to: "Alice", body: "follow up", targets: ["a"] });
+    ok("reply detected from log (restart-safe)", again.isReply === true);
+    fs.rmSync(root2, { recursive: true, force: true });
+  });
+
   await t("project memory (MEMORY.md)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memo-"));
     // first append seeds the header

@@ -452,10 +452,33 @@ export async function sendMessage(root, team, msg) {
   if (!meta) return { ok: false, error: `Team "${team}" does not exist.` };
   const targets = msg.targets || [];
   if (!targets.length) return { ok: false, error: "no recipients" };
+  const now = Date.now();
+  const members = await loadMembers(root, team).catch(() => ({}));
+  // Airtight reply rule: a DM back to someone who recently messaged you is a
+  // reply, and replies ALWAYS wake the recipient — no model cooperation needed.
+  // Detected statelessly from the audit log (survives restarts): target's
+  // message to me within the window, or a broadcast from them, or an explicit
+  // replyTo.
+  let isReply = false;
+  const singleTargetName =
+    targets.length === 1 ? members[targets[0]]?.name || null : null;
+  if (!String(msg.to || "").toLowerCase().startsWith("role:") && singleTargetName) {
+    const windowMs = 60 * 60 * 1000;
+    const tail = await readLogTail(root, team);
+    isReply = tail.some(
+      (e) =>
+        e.event === "message" &&
+        e.from === singleTargetName &&
+        (e.to === msg.fromName || e.to === "everyone") &&
+        now - (e.ts || 0) < windowMs,
+    );
+  }
+  if (msg.replyTo) isReply = true;
+  const wake = msg.wake === true || isReply;
   const envelope = {
     id: `msg_${Date.now()}_${randomUUID().slice(0, 8)}`,
     type: msg.type || "dm", // dm | broadcast | task | report | system
-    ts: Date.now(),
+    ts: now,
     from: msg.from,
     fromName: msg.fromName,
     fromRole: msg.fromRole,
@@ -463,7 +486,8 @@ export async function sendMessage(root, team, msg) {
     subject: msg.subject || null,
     body: msg.body || "",
     priority: msg.priority || "normal",
-    wake: msg.wake === true,
+    wake,
+    isReply,
     replyTo: msg.replyTo || null,
   };
   let delivered = 0;
@@ -488,12 +512,10 @@ export async function sendMessage(root, team, msg) {
     wake: envelope.wake,
   });
   // Liveness of targets, so senders can warn about queued-but-unread messages.
-  const members = await loadMembers(root, team).catch(() => ({}));
-  const now = Date.now();
   const offlineTargets = targets
     .map((tid) => ({ id: tid, name: members[tid]?.name || tid.slice(0, 8) }))
     .filter((t) => isMemberDead(members[t.id], now));
-  return { ok: true, delivered, id: envelope.id, wake: envelope.wake, offlineTargets };
+  return { ok: true, delivered, id: envelope.id, wake: envelope.wake, isReply: envelope.isReply, offlineTargets };
 }
 
 // Read and REMOVE all pending messages for a member. Read == consumed, so a
@@ -595,6 +617,32 @@ export async function writeBoard(root, team, topic, content) {
 // ---------------------------------------------------------------------------
 // Audit log
 // ---------------------------------------------------------------------------
+
+// Tail-read the audit log efficiently (last `lines` entries within the last
+// `maxBytes`), for cheap reply detection on every send.
+export async function readLogTail(root, team, { lines = 200, maxBytes = 256 * 1024 } = {}) {
+  const file = path.join(teamDir(root, team), "log.jsonl");
+  try {
+    const st = await fsp.stat(file);
+    const start = Math.max(0, st.size - maxBytes);
+    const fh = await fsp.open(file, "r");
+    const buf = Buffer.alloc(st.size - start);
+    await fh.read(buf, 0, buf.length, start);
+    await fh.close();
+    const slice = buf.toString("utf8").split("\n").filter(Boolean).slice(-lines);
+    return slice
+      .map((l) => {
+        try {
+          return JSON.parse(l);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
 
 export async function readLog(root, team, limit = 100) {
   try {
