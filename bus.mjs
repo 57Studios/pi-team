@@ -17,6 +17,12 @@ import { randomUUID } from "node:crypto";
 export const TEAMS_ROOT_DEFAULT = path.join(os.homedir(), ".pi", "teams");
 export const TEAM_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export const BOARD_TOPIC_RE = /^[A-Za-z0-9._-]{1,64}$/;
+// True when a member record is unreachable: graceful shutdown (offline) or a
+// heartbeat that has gone stale (crash / power loss).
+export function isMemberDead(m, now = Date.now()) {
+  return !m || m.status === "offline" || now - (m.lastSeen || 0) > STALE_MEMBER_MS;
+}
+
 // A same-name occupant is reclaimable when its session is dead: it marked
 // itself offline (graceful shutdown) or its heartbeat has gone stale. Live
 // members touch lastSeen every HEARTBEAT_MS, so a stale lastSeen means the
@@ -470,20 +476,24 @@ export async function sendMessage(root, team, msg) {
     );
     delivered++;
   }
-  await appendLine(
-    path.join(teamDir(root, team), "log.jsonl"),
-    JSON.stringify({
-      ts: envelope.ts,
-      event: "message",
-      id: envelope.id,
-      type: envelope.type,
-      from: envelope.fromName,
-      to: envelope.to,
-      subject: envelope.subject,
-      priority: envelope.priority,
-    }),
-  );
-  return { ok: true, delivered, id: envelope.id };
+  await appendTeamLog(root, team, {
+    ts: envelope.ts,
+    event: "message",
+    id: envelope.id,
+    type: envelope.type,
+    from: envelope.fromName,
+    to: envelope.to,
+    subject: envelope.subject,
+    priority: envelope.priority,
+    wake: envelope.wake,
+  });
+  // Liveness of targets, so senders can warn about queued-but-unread messages.
+  const members = await loadMembers(root, team).catch(() => ({}));
+  const now = Date.now();
+  const offlineTargets = targets
+    .map((tid) => ({ id: tid, name: members[tid]?.name || tid.slice(0, 8) }))
+    .filter((t) => isMemberDead(members[t.id], now));
+  return { ok: true, delivered, id: envelope.id, wake: envelope.wake, offlineTargets };
 }
 
 // Read and REMOVE all pending messages for a member. Read == consumed, so a
@@ -724,6 +734,7 @@ export async function createTask(root, team, spec) {
           subject: kind === "review" ? `assigned: review of ${reviewOf}` : `assigned: ${task.title}`,
           body,
           priority: "high",
+          wake: true,
           targets: tgt.ids,
         });
         notified = tgt.ids.length;
@@ -885,6 +896,7 @@ export async function updateTask(root, team, taskId, patch, actor) {
           to: task.createdByName,
           subject: `task done: ${task.title}`,
           body: task.evidence || "",
+          wake: true,
           targets: tgt.ids,
         });
         notified += tgt.ids.length;
@@ -910,6 +922,7 @@ export async function updateTask(root, team, taskId, patch, actor) {
           to: "coordinator",
           subject: `task ${task.status}: ${task.title}`,
           body: task.status === "blocked" ? task.blockedReason || "" : task.failReason || "",
+          wake: true,
           targets,
         });
         notified += targets.length;
@@ -932,6 +945,7 @@ export async function updateTask(root, team, taskId, patch, actor) {
               `Review of task ${bounced.id} failed by ${actor.name}: ${task.failReason || "no reason given"}\n` +
               `Please fix the issues and re-complete with task_done --evidence.`,
             priority: "high",
+            wake: true,
             targets: tgt.ids,
           });
           notified += tgt.ids.length;
@@ -1035,6 +1049,7 @@ export async function updateTask(root, team, taskId, patch, actor) {
               `Evidence: ${task.evidence || ""}\n\n` +
               `Complete with: team task_done task_id=${researchId} --evidence "<findings + sources>", and DM the requester with the full report + a tldr to the coordinator.`,
             priority: "high",
+            wake: true,
             targets: rtgt.ids,
           });
           notified += rtgt.ids.length;
@@ -1059,6 +1074,7 @@ export async function updateTask(root, team, taskId, patch, actor) {
           body:
             `${actor.name} completed ${taskId} with LOW confidence.\nEvidence: ${task.evidence || ""}\n` +
             (researchTaskId ? `Auto-created research follow-up ${researchTaskId} (assigned to ${researchAssignee}).` : "No researcher/coordinator available to route a follow-up — review the evidence yourself."),
+          wake: true,
           targets,
         });
         notified += targets.length;
@@ -1296,4 +1312,45 @@ export async function memoAppend(cwd, { team, name, role, body }) {
     await writeTextAtomic(file, existing + lines.join("\n"));
     return { ok: true, file };
   });
+}
+
+// ---------------------------------------------------------------------------
+// Await replies: poll my inbox until the expected members have replied (or
+// the timeout / abort signal fires). Drained messages are consumed (read ==
+// consumed, like `inbox`). Testable: pollMs is injectable.
+// ---------------------------------------------------------------------------
+
+export async function awaitReplies(
+  root,
+  team,
+  selfId,
+  expectedNames,
+  { mode = "all", timeoutMs = 3 * 60 * 1000, pollMs = 3000, signal } = {},
+) {
+  const want = new Set(expectedNames.filter(Boolean));
+  const replied = new Map(); // name -> messages[]
+  const deadline = Date.now() + timeoutMs;
+  const started = Date.now();
+  while (Date.now() < deadline) {
+    if (signal?.aborted) break;
+    const msgs = await drainInbox(root, team, selfId);
+    for (const m of msgs) {
+      const fromName = m.fromName || m.from;
+      if (fromName && want.has(fromName) && m.from !== selfId) {
+        if (!replied.has(fromName)) replied.set(fromName, []);
+        replied.get(fromName).push(m);
+      }
+    }
+    const allReplied = [...want].every((n) => replied.has(n));
+    const anyReplied = replied.size > 0;
+    if (mode === "all" ? allReplied : anyReplied) break;
+    if (pollMs > 0) await sleep(pollMs);
+  }
+  const missing = [...want].filter((n) => !replied.has(n));
+  return {
+    replied: [...replied.entries()].map(([name, msgs]) => ({ name, msgs })),
+    missing,
+    elapsedMs: Date.now() - started,
+    timedOut: missing.length > 0,
+  };
 }

@@ -299,6 +299,40 @@ const main = async () => {
     fs.rmSync(root2, { recursive: true, force: true });
   });
 
+  await t("wake echo, liveness, task notifications, awaitReplies", async () => {
+    const root2 = path.join(root, "wake2");
+    await bus.createTeam(root2, "w2", {});
+    await bus.joinMember(root2, "w2", { id: "a", name: "Alice", role: "coordinator" });
+    await bus.joinMember(root2, "w2", { id: "b", name: "Bob", role: "implementer" });
+    // dead member detection
+    await bus.joinMember(root2, "w2", { id: "c", name: "Carol", role: "researcher" });
+    bus.setMemberStatusSync(root2, "w2", "c", "offline");
+    const now = Date.now();
+    ok("offline member is dead", bus.isMemberDead((await bus.loadMembers(root2, "w2")).c, now));
+    ok("live member not dead", !bus.isMemberDead((await bus.loadMembers(root2, "w2")).b, now));
+    // sendMessage: wake + offlineTargets + log
+    const sent = await bus.sendMessage(root2, "w2", { type: "dm", from: "a", fromName: "Alice", fromRole: "coordinator", to: "Carol", body: "hi", wake: true, targets: ["c"] });
+    ok("send echoes wake", sent.wake === true);
+    ok("offline target flagged", sent.offlineTargets.length === 1 && sent.offlineTargets[0].name === "Carol");
+    const log = await bus.readLog(root2, "w2", 5);
+    ok("log records wake", log.some((e) => e.event === "message" && e.wake === true));
+    // task assignment notification wakes the assignee
+    const t = await bus.createTask(root2, "w2", { title: "x", assignee: "role:implementer", createdBy: "a", createdByName: "Alice" });
+    ok("task created", t.ok);
+    const bobIn = await bus.drainInbox(root2, "w2", "b");
+    ok("task assignment notification is wake", bobIn.some((m) => m.type === "task" && m.wake === true));
+    // awaitReplies: inject a reply mid-poll
+    const waiter = bus.awaitReplies(root2, "w2", "a", ["Bob"], { mode: "all", timeoutMs: 3000, pollMs: 50 });
+    await new Promise((r) => setTimeout(r, 200));
+    await bus.sendMessage(root2, "w2", { type: "dm", from: "b", fromName: "Bob", fromRole: "implementer", to: "Alice", body: "here I am", targets: ["a"] });
+    const res = await waiter;
+    ok("awaitReplies got the reply", res.replied.length === 1 && res.replied[0].name === "Bob" && !res.timedOut);
+    // awaitReplies timeout path
+    const res2 = await bus.awaitReplies(root2, "w2", "a", ["Ghost"], { mode: "all", timeoutMs: 300, pollMs: 50 });
+    ok("awaitReplies times out with missing", res2.missing.includes("Ghost") && res2.timedOut);
+    fs.rmSync(root2, { recursive: true, force: true });
+  });
+
   await t("project memory (MEMORY.md)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memo-"));
     // first append seeds the header

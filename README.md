@@ -89,7 +89,11 @@ with other harnesses' root-level `MEMORY.md` / `AGENTS.md` conventions:
 - **`team dm --wake` / `team task --wake`** → the recipient's pi **starts a
   turn** even while idle, so urgent/status-check messages get actual replies
   (rate-limited to ~3 auto-turns/min). This is the "nudge" for when the
-  coordinator needs an answer now.
+  coordinator needs an answer now. Send results **echo whether wake applied**
+  ("wake: YES/NO") and warn when a recipient is offline — so the model can't
+  claim it woke people it didn't. Task assignments and task-event
+  notifications (done/blocked/failed/bounced/low-confidence) always wake; so
+  does `team report`.
 - **`/team config --auto-respond on|off`** (coordinator) → idle members
   auto-start a turn whenever a DM arrives (rate-limited). Default off to avoid
   surprise turns and ping-pong loops.
@@ -98,6 +102,10 @@ with other harnesses' root-level `MEMORY.md` / `AGENTS.md` conventions:
 - **New DM while mid-turn** → injected before the agent's next LLM call
   (soft interrupt, like jcode).
 - Agents can also check anytime with `team inbox` (via the `team` tool).
+- **`team await_members --to Bob --timeout_minutes 5`** (or
+  `/team await Bob --minutes 5 [--any]`) — blocks until the listed members
+  reply or the timeout hits, instead of manually polling the inbox and giving
+  up too early (the exact failure that stranded a late reply).
 
 The briefing is **role-aware**: workers see the research/confidence protocol,
 and a member with the `researcher` role sees their *duty* instead.
@@ -149,7 +157,7 @@ instructions. The coordinator can extend the mission text (`team briefing
 | `team report --body "..."` | send completion report to `role:coordinator` |
 | `team broadcast --body "..."` | message everyone |
 | `team inbox` | read pending messages (drains) |
-| `team roster` | list members, roles, statuses |
+| `team roster` | list members, roles, statuses (offline members marked) |
 | `team board_write --topic design --body "..."` | share a design note |
 | `team board_read [--topic T]` | read board topics / one topic |
 | `team status --status "blocked on parser"` | update your status |

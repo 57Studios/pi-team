@@ -35,7 +35,7 @@ const ACTIONS = [
   "inbox", "board_write", "board_read", "status", "whoami", "set_role",
   "spawn", "selftest",
   "task_create", "task_list", "task_show", "task_start", "task_done", "task_blocked", "task_fail", "task_assign",
-  "preset_show", "preset_save", "preset_create", "revive", "briefing", "memo", "config",
+  "preset_show", "preset_save", "preset_create", "revive", "briefing", "memo", "config", "await_members",
 ] as const;
 
 const TEAM_IDENTITY_ENTRY = "team-identity";
@@ -167,7 +167,7 @@ export default function (pi: ExtensionAPI) {
   ): string {
     const roster = bus.rosterList(members, me.id);
     const now = Date.now();
-    const dead = (m: any) => m.status === "offline" || now - (m.lastSeen || 0) > bus.STALE_MEMBER_MS;
+    const dead = (m: any) => bus.isMemberDead(m, now);
     const mark = (m: any) => `${m.name}(${m.role}${dead(m) ? ", offline" : ""})`;
     const coordinators = roster.filter((m) => bus.hasRole(m.role, "coordinator"));
     const reviewers = roster.filter((m) => bus.hasRole(m.role, "reviewer"));
@@ -562,7 +562,7 @@ export default function (pi: ExtensionAPI) {
     return out;
   }
 
-  async function handleAction(p: Record<string, any>, c: ExtensionContext): Promise<string> {
+  async function handleAction(p: Record<string, any>, c: ExtensionContext, signal?: AbortSignal): Promise<string> {
     const root = p.dir?.trim() || bus.teamsRoot(process.env);
     const me = await myTeam(c);
     const id = safeSessionId(c);
@@ -618,9 +618,10 @@ export default function (pi: ExtensionAPI) {
       case "roster": {
         if (!me) return notInTeam;
         const members = await bus.loadMembers(root, me.team);
+        const now = Date.now();
         const rows = bus
           .rosterList(members, me.id)
-          .map((m) => `- ${m.name} (${m.role}) — ${m.status || "idle"}${m.self ? " (you)" : ""}`);
+          .map((m) => `- ${m.name} (${m.role}) — ${bus.isMemberDead(m, now) ? "offline" : m.status || "idle"}${m.self ? " (you)" : ""}`);
         return `Team "${me.team}" — ${Object.keys(members).length} member(s):\n${rows.join("\n")}`;
       }
 
@@ -655,6 +656,8 @@ export default function (pi: ExtensionAPI) {
         const subject =
           String(p.subject || "").trim() ||
           (type === "task" ? "task assignment" : type === "report" ? "completion report" : "");
+        // Reports always wake the recipient: the coordinator is waiting on them.
+        const wake = p.action === "report" ? true : p.wake === true;
         const sent = await bus.sendMessage(root, me.team, {
           type,
           from: me.id,
@@ -664,11 +667,15 @@ export default function (pi: ExtensionAPI) {
           subject,
           body,
           priority: type === "task" ? "high" : "normal",
-          wake: p.wake === true,
+          wake,
           targets,
         });
         if (!sent.ok) return `error: ${sent.error}`;
-        return `Sent ${type} to ${toLabel} (${sent.delivered} recipient${sent.delivered > 1 ? "s" : ""}).`;
+        let out = `Sent ${type} to ${toLabel} (${sent.delivered} recipient${sent.delivered > 1 ? "s" : ""}) — wake: ${sent.wake ? "YES" : "NO"}.`;
+        if (sent.offlineTargets?.length) {
+          out += `\nWarning: ${sent.offlineTargets.map((t: any) => t.name).join(", ")} ${sent.offlineTargets.length > 1 ? "appear" : "appears"} offline — the message is queued and will surface on their next turn; use dm --wake or team revive to reach them now.`;
+        }
+        return out;
       }
 
       case "inbox": {
@@ -820,6 +827,31 @@ export default function (pi: ExtensionAPI) {
         return buildBriefing(me, members, brief);
       }
 
+      case "await_members": {
+        if (!me) return notInTeam;
+        const to = String(p.to || "").trim();
+        if (!to) return "error: to required (member name or role:<role>).";
+        const members = await bus.loadMembers(root, me.team);
+        const tgt = bus.resolveTargets(members, me.id, to);
+        if (tgt.error) return `error: ${tgt.error}`;
+        const names = tgt.ids.map((id: string) => members[id]?.name).filter(Boolean);
+        if (!names.length) return "error: no valid targets.";
+        const timeoutMs = Math.max(1, Math.min(p.timeout_minutes || 3, 30)) * 60_000;
+        const res = await bus.awaitReplies(root, me.team, me.id, names, {
+          mode: p.mode === "any" ? "any" : "all",
+          timeoutMs,
+          signal,
+        });
+        const lines = [`Awaited ${names.join(", ")} (${(res.elapsedMs / 1000).toFixed(0)}s):`];
+        for (const { name, msgs } of res.replied) {
+          lines.push(`- ${name}: ${msgs.map((m: any) => m.subject || m.body || "(reply)").join(" | ")}`);
+        }
+        if (res.missing.length) {
+          lines.push(`No reply (timeout): ${res.missing.join(", ")}.`);
+        }
+        return lines.join("\n");
+      }
+
       case "config": {
         if (!me) return notInTeam;
         if (p.auto_respond !== undefined) {
@@ -891,7 +923,7 @@ export default function (pi: ExtensionAPI) {
     name: "team",
     label: "Team",
     description:
-      "Coordinate with other pi agents in your team (like a company): join teams, DM teammates, assign tasks, post reports, share a board, and track a structured task board. Actions: create, join, leave, roster, dm, broadcast, task, report, inbox, board_write, board_read, status, whoami, set_role, spawn, selftest, task_create, task_list, task_show, task_start, task_done, task_blocked, task_fail, task_assign, preset_show, preset_save, preset_create, revive, briefing (read, or set the team mission as coordinator), memo (append to MEMORY.md project memory in the working directory). Address recipients by member name or role:<role> (e.g. role:implementer). Reports go to role:coordinator by default. Tasks live on the team board; completing one REQUIRES evidence, is blocked on unfinished dependencies unless dep_override, and kind=review tasks gate a reviewed task (failure bounces it back to running).",
+      "Coordinate with other pi agents in your team (like a company): join teams, DM teammates, assign tasks, post reports, share a board, and track a structured task board. Actions: create, join, leave, roster, dm, broadcast, task, report, inbox, board_write, board_read, status, whoami, set_role, spawn, selftest, task_create, task_list, task_show, task_start, task_done, task_blocked, task_fail, task_assign, preset_show, preset_save, preset_create, revive, briefing (read, or set the team mission as coordinator), memo (append to MEMORY.md project memory in the working directory), await_members (wait for replies with a timeout). Address recipients by member name or role:<role> (e.g. role:implementer). Reports go to role:coordinator by default. Tasks live on the team board; completing one REQUIRES evidence, is blocked on unfinished dependencies unless dep_override, and kind=review tasks gate a reviewed task (failure bounces it back to running).",
     promptSnippet: "Coordinate with teammate pi agents via team: DM, assign tasks, post reports, share a board, track tasks",
     promptGuidelines: [
       "Use team when the user wants multiple agents to work together or you need help from a teammate.",
@@ -899,7 +931,9 @@ export default function (pi: ExtensionAPI) {
       "Prefer team task_create for anything with multiple steps: it records the task on the team board with status, acceptance criteria, and evidence. team task is the lightweight DM version.",
       "Use team task_create with kind=review and review_of=<task id> to add an independent review gate: the reviewer passes with task_done --evidence or bounces the work back with task_fail --body '<issues>'.",
       "Use team task_done with task_id and evidence (what changed, file refs, validation) to complete a board task — evidence is required and unfinished dependencies block completion unless you pass dep_override with a reason.",
-      "Use team report to send your completion report to role:coordinator after finishing assigned work.",
+      "Use team report to send your completion report to role:coordinator after finishing assigned work (reports wake the coordinator automatically).",
+      "If you intend to wake idle recipients, you MUST pass wake:true on the dm/task call — the tool result echoes whether wake was applied.",
+      "After sending wake DMs, use team await_members (to=..., timeout_minutes=...) to block until replies arrive or the timeout hits, instead of polling inbox manually.",
       "Use team roster to see teammates and roles; use team inbox to check for new messages mid-turn.",
       "Every turn starts with a [team-context] briefing: your role, the mission, who to report to (role:coordinator), where completed work goes (role:reviewer), and the team protocol. Follow it.",
       "If your work crosses another member's scope, DM them directly to coordinate.",
@@ -928,11 +962,13 @@ export default function (pi: ExtensionAPI) {
       prompt: Type.Optional(Type.String({ description: "Kickoff prompt for the spawn action." })),
       wake: Type.Optional(Type.Boolean({ description: "Wake the recipient(s) on dm/broadcast/task/report: an idle member starts a turn to act on it now (rate-limited). Use for urgent or status-check messages." })),
       auto_respond: Type.Optional(Type.Boolean({ description: "For config: set team autoRespond (coordinator only)." })),
+      timeout_minutes: Type.Optional(Type.Number({ description: "For await_members: max minutes to wait (1-30, default 3)." })),
+      mode: Type.Optional(StringEnum(["all", "any"] as const)),
       preset: Type.Optional(Type.Array(Type.Object({ name: Type.String(), role: Type.Optional(Type.String()) }), { description: "For preset_create: the roster, e.g. [{name:'Optimus', role:'coordinator, reviewer'}, ...]. Roles may be comma-separated." })),
       dir: Type.Optional(Type.String({ description: "Team root directory override (default ~/.pi/teams)." })),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, c) {
-      const text = await handleAction(params as Record<string, any>, c).catch((e: any) => {
+    async execute(_toolCallId, params, signal, _onUpdate, c) {
+      const text = await handleAction(params as Record<string, any>, c, signal).catch((e: any) => {
         return `team error: ${e?.message ?? e}`;
       });
       return { content: [{ type: "text", text }], details: {} };
@@ -1066,6 +1102,27 @@ export default function (pi: ExtensionAPI) {
             const res = await bus.memoAppend(c.cwd, { team: me.team, name: me.name, role: me.role, body });
             return notify(`Recorded in ${res.file}.`);
           }
+          case "await": {
+            const me = await myTeam(c);
+            if (!me) return notify("You are not in a team.");
+            const to = argv._.slice(1).join(" ") || argv.to;
+            if (!to) return notify("Usage: /team await <name|role:...> [--minutes N] [--any]");
+            const members = await bus.loadMembers(root, me.team);
+            const tgt = bus.resolveTargets(members, me.id, to);
+            if (tgt.error) return notify(`error: ${tgt.error}`);
+            const names = tgt.ids.map((id: string) => members[id]?.name).filter(Boolean);
+            const timeoutMs = Math.max(1, Math.min(parseFloat(argv.minutes || "3") || 3, 30)) * 60_000;
+            const res = await bus.awaitReplies(root, me.team, me.id, names, {
+              mode: argv.any ? "any" : "all",
+              timeoutMs,
+            });
+            const lines = [`Awaited ${names.join(", ")} (${(res.elapsedMs / 1000).toFixed(0)}s):`];
+            for (const { name, msgs } of res.replied) {
+              lines.push(`- ${name}: ${msgs.map((m: any) => m.subject || m.body || "(reply)").join(" | ")}`);
+            }
+            if (res.missing.length) lines.push(`No reply (timeout): ${res.missing.join(", ")}.`);
+            return notify(lines.join("\n"));
+          }
           case "briefing": {
             const me = await myTeam(c);
             if (!me) return notify("You are not in a team.");
@@ -1187,6 +1244,7 @@ export default function (pi: ExtensionAPI) {
               "/team set-role <role> / set-name <name>       update your role/name",
               "/team prune [--hours N]                       remove dead members (0 = dead only, default 24h)",
               "/team memo <text>                            append to MEMORY.md in this directory (project memory)",
+              "/team await <name|role:...> [--minutes N]     wait for replies (blocks until they arrive or timeout)",
               "/team briefing [--body \"...\"]               read / set the team mission (coordinator can set)",
               "/team preset [save]                           show/refresh the saved team (name + role)",
               "/team preset create N=role [N=role ...]        seed the preset from scratch (multi roles ok)",
