@@ -126,6 +126,12 @@ with other harnesses' root-level `MEMORY.md` / `AGENTS.md` conventions:
   next cycle;Daisy:30:scout scan"`, coordinator-only) — auto-armed at each
   member's session start and re-armed after every fire, so a recurring cadence
   (Zilla's 15-min cycle, 30-min scout scan) runs with zero model cooperation.
+- **Cross-team DMs** — address any member of another team:
+  `team dm to:"Zilla/Zed" --body "..."` (or `"Team/role:role"`). The message
+  lands in the other team's inbox (their watcher auto-reads + wakes them),
+  shows the sender's team in the UI, and is recorded in **both** teams' audit
+  logs — so the airtight reply rule works across the boundary and replies
+  route back to you. dm/report only.
 - **`team search "query"`** (or `/team search <q> [--count N] [--categories
   news]`) — web search via the **local SearXNG** instance, no API key, and
   available to **every team** out of the box: URL resolves from team.json

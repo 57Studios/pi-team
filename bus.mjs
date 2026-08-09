@@ -684,6 +684,25 @@ export function rosterList(members, selfId) {
 
 // Resolve a "to" address: a member name, or role:<role> for every member with
 // that role (excluding the sender).
+// Resolve a cross-team address "TeamName/MemberName" or "TeamName/role:role".
+// Returns the resolved team + members + ids, or { error }.
+export async function resolveCrossTarget(root, to) {
+  const t = String(to || "").trim();
+  if (!t.includes("/")) return null; // not a cross-team address
+  const slash = t.indexOf("/");
+  const teamName = t.slice(0, slash).trim();
+  const memberPart = t.slice(slash + 1).trim();
+  if (!teamName || !memberPart) return { error: `bad cross-team address "${to}" (use TeamName/MemberName or TeamName/role:role)` };
+  const team = await resolveTeamName(root, teamName);
+  if (!team) return { error: `unknown team "${teamName}" in cross-team address` };
+  const members = await loadMembers(root, team);
+  const selfId = "__cross__";
+  const res = resolveTargets(members, selfId, memberPart);
+  if (res.error) return { error: `${res.error} (in team "${team}")` };
+  const names = res.ids.map((id) => members[id]?.name).filter(Boolean);
+  return { team, members, ids: res.ids, names };
+}
+
 export function resolveTargets(members, selfId, to) {
   if (!to || !String(to).trim()) {
     return { ids: [], error: "no target given (use a member name or role:<role>)" };
@@ -700,7 +719,8 @@ export function resolveTargets(members, selfId, to) {
     }
     return { ids };
   }
-  const hits = Object.entries(members).filter(([id, m]) => m && m.name === t && id !== selfId);
+  const tl = t.toLowerCase();
+  const hits = Object.entries(members).filter(([id, m]) => m && String(m.name || "").toLowerCase() === tl && id !== selfId);
   if (!hits.length) {
     const names = rosterList(members, selfId)
       .map((m) => m.name)
@@ -717,13 +737,17 @@ export function resolveTargets(members, selfId, to) {
 // Messaging
 // ---------------------------------------------------------------------------
 
-export async function sendMessage(root, team, msg) {
+export async function sendMessage(root, team, msg, opts = {}) {
   const meta = await loadTeam(root, team);
   if (!meta) return { ok: false, error: `Team "${team}" does not exist.` };
   const targets = msg.targets || [];
   if (!targets.length) return { ok: false, error: "no recipients" };
   const now = Date.now();
-  const members = await loadMembers(root, team).catch(() => ({}));
+  // Cross-team delivery: `team` is the DELIVERY team; logTeams is where the
+  // audit trail lands (both sides for cross-team, so the reply rule works
+  // across the boundary).
+  const members = opts.members || (await loadMembers(root, team).catch(() => ({})));
+  const logTeams = opts.logTeams?.length ? opts.logTeams : [team];
   // Airtight reply rule: a DM back to someone who recently messaged you is a
   // reply, and replies ALWAYS wake the recipient — no model cooperation needed.
   // Detected statelessly from the audit log (survives restarts): target's
@@ -734,14 +758,21 @@ export async function sendMessage(root, team, msg) {
     targets.length === 1 ? members[targets[0]]?.name || null : null;
   if (!String(msg.to || "").toLowerCase().startsWith("role:") && singleTargetName) {
     const windowMs = 60 * 60 * 1000;
-    const tail = await readLogTail(root, team);
-    isReply = tail.some(
-      (e) =>
-        e.event === "message" &&
-        e.from === singleTargetName &&
-        (e.to === msg.fromName || e.to === "everyone") &&
-        now - (e.ts || 0) < windowMs,
-    );
+    for (const lt of logTeams) {
+      const tail = await readLogTail(root, lt);
+      if (
+        tail.some(
+          (e) =>
+            e.event === "message" &&
+            e.from === singleTargetName &&
+            (e.to === msg.fromName || e.to === "everyone") &&
+            now - (e.ts || 0) < windowMs,
+        )
+      ) {
+        isReply = true;
+        break;
+      }
+    }
   }
   if (msg.replyTo) isReply = true;
   const wake = msg.wake === true || isReply;
@@ -752,6 +783,7 @@ export async function sendMessage(root, team, msg) {
     from: msg.from,
     fromName: msg.fromName,
     fromRole: msg.fromRole,
+    fromTeam: msg.fromTeam || null,
     to: msg.to,
     subject: msg.subject || null,
     body: msg.body || "",
@@ -770,17 +802,20 @@ export async function sendMessage(root, team, msg) {
     );
     delivered++;
   }
-  await appendTeamLog(root, team, {
-    ts: envelope.ts,
-    event: "message",
-    id: envelope.id,
-    type: envelope.type,
-    from: envelope.fromName,
-    to: envelope.to,
-    subject: envelope.subject,
-    priority: envelope.priority,
-    wake: envelope.wake,
-  });
+  for (const lt of logTeams) {
+    await appendTeamLog(root, lt, {
+      ts: envelope.ts,
+      event: "message",
+      id: envelope.id,
+      type: envelope.type,
+      from: envelope.fromName,
+      fromTeam: envelope.fromTeam || null,
+      to: envelope.to,
+      subject: envelope.subject,
+      priority: envelope.priority,
+      wake: envelope.wake,
+    });
+  }
   // Liveness of targets, so senders can warn about queued-but-unread messages.
   const offlineTargets = targets
     .map((tid) => ({ id: tid, name: members[tid]?.name || tid.slice(0, 8) }))

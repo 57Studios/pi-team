@@ -522,6 +522,43 @@ const main = async () => {
     ok("empty query rejected", !(await bus.searchWeb("  ")).ok);
   });
 
+  await t("cross-team DMs (Team/Member addressing + both-side audit + reply rule)", async () => {
+    const root2 = path.join(root, "xteam");
+    await bus.createTeam(root2, "Alpha", {});
+    await bus.createTeam(root2, "Zilla", {});
+    await bus.joinMember(root2, "Alpha", { id: "a1", name: "Optimus", role: "coordinator" });
+    await bus.joinMember(root2, "Zilla", { id: "z1", name: "Zed", role: "Hub" });
+    await bus.joinMember(root2, "Zilla", { id: "z2", name: "Mint", role: "Math" });
+    const zMembers = await bus.loadMembers(root2, "Zilla");
+    // resolution
+    const r1 = await bus.resolveCrossTarget(root2, "Zilla/Zed");
+    ok("cross resolves member", r1 && r1.team === "Zilla" && r1.names[0] === "Zed");
+    ok("cross case-insensitive team", (await bus.resolveCrossTarget(root2, "zilla/zed")).team === "Zilla");
+    const rRole = await bus.resolveCrossTarget(root2, "Zilla/role:coordinator");
+    ok("cross role resolves Hub alias", rRole && rRole.names[0] === "Zed");
+    ok("cross unknown team errors", (await bus.resolveCrossTarget(root2, "Nope/Zed")).error);
+    ok("cross unknown member errors", (await bus.resolveCrossTarget(root2, "Zilla/Nobody")).error);
+    ok("non-cross returns null", (await bus.resolveCrossTarget(root2, "Zed")) === null);
+    // delivery: Optimus -> Zed, lands in Zilla's inbox + both audit logs
+    const sent = await bus.sendMessage(root2, "Zilla", {
+      type: "dm", from: "a1", fromName: "Optimus", fromRole: "coordinator", fromTeam: "Alpha",
+      to: "Zed", subject: "hello", body: "coordinate on the cycle", wake: true, targets: ["z1"],
+    }, { members: zMembers, logTeams: ["Zilla", "Alpha"] });
+    ok("cross dm sent", sent.ok);
+    const zedInbox = await bus.drainInbox(root2, "Zilla", "z1");
+    ok("delivered to target team inbox", zedInbox.some((m) => m.fromName === "Optimus" && m.fromTeam === "Alpha"));
+    ok("both audit logs have it", (await bus.readLog(root2, "Zilla", 50)).some((e) => e.event === "message" && e.from === "Optimus")
+      && (await bus.readLog(root2, "Alpha", 50)).some((e) => e.event === "message" && e.from === "Optimus"));
+    // reply rule across the boundary: Zed -> Optimus is a reply (wake forced)
+    const aMembers = await bus.loadMembers(root2, "Alpha");
+    const reply = await bus.sendMessage(root2, "Alpha", {
+      type: "dm", from: "z1", fromName: "Zed", fromRole: "Hub", fromTeam: "Zilla",
+      to: "Optimus", subject: "re: hello", body: "sure, 15-min cycle", wake: false, targets: ["a1"],
+    }, { members: aMembers, logTeams: ["Alpha", "Zilla"] });
+    ok("cross reply classified as reply (airtight wake)", reply.ok && reply.isReply === true && reply.wake === true);
+    fs.rmSync(root2, { recursive: true, force: true });
+  });
+
   await t("project memory (MEMORY.md)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memo-"));
     // first append seeds the header

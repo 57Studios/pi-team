@@ -217,6 +217,7 @@ export default function (pi: ExtensionAPI) {
         "- Status checks are NON-BLOCKING: use team checkin (wake-DMs everyone, then END YOUR TURN). Replies auto-wake you one at a time with progress; never sleep or poll the inbox waiting for replies.",
         "- To be woken by the harness later (e.g. check back in 30 min), set a timer: team later --minutes 30 --body \"...\" (or --at HH:MM). The harness pings you with a turn when it fires; timers survive restarts.",
         "- Web search is built in: team search \"query\" (SearXNG on localhost — no API key; use --categories news for news). Scout/research work: search first, then verify the top hits before citing.",
+        "- Cross-team: you can DM (or report to) a member of ANOTHER team with to='TeamName/MemberName' or 'TeamName/role:role', e.g. team dm to:'Zilla/Zed' --body \"...\". Replies route back; both teams' audit logs record it. Cross-team is for dm/report only.",
       );
       if (researchers.length) {
         lines.push(
@@ -260,7 +261,7 @@ export default function (pi: ExtensionAPI) {
                     : m.type === "broadcast"
                       ? "BROADCAST"
                       : "DM";
-      const head = `${kind} from ${m.fromName || m.from} (${m.fromRole || "agent"})${
+      const head = `${kind} from ${m.fromName || m.from} (${m.fromRole || "agent"}${m.fromTeam ? ` · ${m.fromTeam}` : ""})${
         m.subject ? ` — ${m.subject}` : ""
       }${m.priority === "high" ? " [high priority]" : ""}${m.wake ? " [wake]" : ""}`;
       return `${head}\n${m.body || ""}`.trimEnd();
@@ -932,6 +933,32 @@ export default function (pi: ExtensionAPI) {
           toLabel = "everyone";
         } else {
           const to = p.action === "report" ? p.to || "role:coordinator" : p.to;
+          // Cross-team address "TeamName/MemberName" (dm + report only).
+          const cross = String(to || "").includes("/") ? await bus.resolveCrossTarget(root, to) : null;
+          if (cross && cross.error) return `error: ${cross.error}`;
+          if (cross) {
+            targets = cross.ids;
+            toLabel = `${cross.names.join(", ")} (${cross.team})`;
+            // cross-team sends land in BOTH audit logs so the reply rule
+            // works across the boundary; wake by default (explicit outreach).
+            const sent = await bus.sendMessage(root, cross.team, {
+              type: p.action === "report" ? "report" : "dm",
+              from: me.id,
+              fromName: me.name,
+              fromRole: me.role,
+              fromTeam: me.team,
+              // Recipient NAMES (not the address) so the airtight reply rule
+              // matches across the boundary; fromTeam carries the context.
+              to: cross.names.join(", "),
+              subject: String(p.subject || "").trim() || (p.action === "report" ? "completion report" : ""),
+              body,
+              priority: "normal",
+              wake: p.wake !== false,
+              targets: cross.ids,
+            }, { members: cross.members, logTeams: [cross.team, me.team] });
+            if (!sent.ok) return `error: ${sent.error}`;
+            return `Cross-team ${p.action === "report" ? "report" : "dm"} sent to ${toLabel} — wake: ${sent.wake ? "YES" : "NO"}. (Their watcher will wake them; replies route back to you.)`;
+          }
           const res = bus.resolveTargets(members, me.id, to);
           if (res.error) return `error: ${res.error}`;
           targets = res.ids;
