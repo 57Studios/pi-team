@@ -200,6 +200,36 @@ export function hasRole(role, wanted) {
   return roleSet(role).includes(String(wanted || "").trim().toLowerCase());
 }
 
+// Lenient confidence parsing for task_done (jcode-style): word rungs, negations,
+// and 0-1 / 0-10 / 0-100 scores. Returns "low" | "medium" | "high" | null.
+export function parseConfidence(raw) {
+  const v = String(raw || "").trim().toLowerCase();
+  if (!v) return null;
+  const negated = ["not confident", "not certain", "not sure", "unsure", "uncertain", "no confidence", "no idea", "guessing", "not verified"];
+  if (negated.some((n) => v.includes(n))) return "low";
+  if (v.includes("low")) return "low";
+  if (v.includes("med") || v.includes("moderate")) return "medium";
+  if (v.includes("high") || v.includes("confident") || v.includes("certain")) return "high";
+  const m = v.match(/(\d+(?:\.\d+)?)/);
+  if (m) {
+    const n = parseFloat(m[1]);
+    if (v.includes("%") || n > 10) {
+      if (n < 50) return "low";
+      if (n < 80) return "medium";
+      return "high";
+    }
+    if (n <= 1) {
+      if (n < 0.5) return "low";
+      if (n < 0.8) return "medium";
+      return "high";
+    }
+    if (n < 5) return "low";
+    if (n < 8) return "medium";
+    return "high";
+  }
+  return null;
+}
+
 export async function joinMember(root, team, { id, name, role, rejoin = false }) {
   const meta = await loadTeam(root, team);
   if (!meta) {
@@ -609,6 +639,7 @@ export async function createTask(root, team, spec) {
       startedAt: null,
       doneAt: null,
       evidence: null,
+      confidence: null,
       blockedReason: null,
       failReason: null,
       updatedAt: Date.now(),
@@ -725,6 +756,7 @@ export async function updateTask(root, team, taskId, patch, actor) {
         }
         task.evidence = evidence;
         task.doneAt = Date.now();
+        task.confidence = parseConfidence(patch.confidence);
       }
       // A passing REVIEW task accepts the reviewed work (closes the loop with
       // the bounce: fail -> running, pass -> done).
@@ -896,8 +928,102 @@ export async function updateTask(root, team, taskId, patch, actor) {
       task.updatedAt = Date.now();
     }
 
+    // Low-confidence completion: escalate to the coordinator and auto-create a
+    // research follow-up task (assigned to the researcher, else the
+    // coordinator) so uncertainty becomes structured work, not a footnote.
+    // Created inline (not via createTask) to stay inside this lock.
+    let lowConfidence = false;
+    let researchTaskId = null;
+    if (task.status === "done" && task.confidence === "low") {
+      lowConfidence = true;
+      const researchId = `t_${Date.now().toString(36)}_${randomUUID().slice(0, 4)}`;
+      const researchAssignee = members && Object.values(members).some((m) => m && hasRole(m.role, "researcher"))
+        ? "role:researcher"
+        : members && Object.values(members).some((m) => m && hasRole(m.role, "coordinator"))
+          ? "role:coordinator"
+          : null;
+      if (researchAssignee) {
+        tasks.push({
+          id: researchId,
+          title: `research follow-up: ${task.title}`,
+          body:
+            `Task ${task.id} was completed with LOW confidence by ${actor.name}.\n` +
+            `Evidence: ${task.evidence || ""}\n\n` +
+            `Investigate the weak areas, verify the claims, and report findings back to ${actor.name} (and a tldr to the coordinator).`,
+          assignee: researchAssignee,
+          status: "queued",
+          priority: "high",
+          kind: "work",
+          reviewOf: null,
+          criteria: ["verify the low-confidence claims", "report findings to the requester + tldr to coordinator"],
+          dependsOn: [taskId],
+          createdBy: actor.id,
+          createdByName: actor.name,
+          createdAt: Date.now(),
+          assignedAt: null,
+          startedAt: null,
+          doneAt: null,
+          evidence: null,
+          confidence: null,
+          blockedReason: null,
+          failReason: null,
+          updatedAt: Date.now(),
+        });
+        researchTaskId = researchId;
+        await appendTeamLog(root, team, {
+          ts: Date.now(),
+          event: "task_low_confidence",
+          task: taskId,
+          research_task: researchId,
+          by: actor.name,
+        });
+        // Notify the assignee of the follow-up (same as a normal task create).
+        const rtgt = resolveTargets(members, actor.id, researchAssignee);
+        if (!rtgt.error && rtgt.ids.length) {
+          await sendMessage(root, team, {
+            type: "task",
+            from: actor.id,
+            fromName: actor.name,
+            fromRole: actor.role,
+            to: researchAssignee,
+            subject: `assigned: research follow-up for ${taskId}`,
+            body:
+              `Research follow-up for task ${taskId} (completed with LOW confidence by ${actor.name}).\n` +
+              `Evidence: ${task.evidence || ""}\n\n` +
+              `Complete with: team task_done task_id=${researchId} --evidence "<findings + sources>", and DM the requester with the full report + a tldr to the coordinator.`,
+            priority: "high",
+            targets: rtgt.ids,
+          });
+          notified += rtgt.ids.length;
+        }
+      }
+      // Notify the coordinator (fallback: the creator).
+      let targets = [];
+      const coord = resolveTargets(members, actor.id, "role:coordinator");
+      if (!coord.error) targets = coord.ids;
+      if (!targets.length && task.createdByName) {
+        const creator = resolveTargets(members, actor.id, task.createdByName);
+        if (!creator.error) targets = creator.ids;
+      }
+      if (targets.length) {
+        await sendMessage(root, team, {
+          type: "task_low_confidence",
+          from: actor.id,
+          fromName: actor.name,
+          fromRole: actor.role,
+          to: "coordinator",
+          subject: `low confidence: ${task.title}`,
+          body:
+            `${actor.name} completed ${taskId} with LOW confidence.\nEvidence: ${task.evidence || ""}\n` +
+            (researchTaskId ? `Auto-created research follow-up ${researchTaskId} (assigned to ${researchAssignee}).` : "No researcher/coordinator available to route a follow-up — review the evidence yourself."),
+          targets,
+        });
+        notified += targets.length;
+      }
+    }
+
     await writeJsonAtomic(path.join(teamDir(root, team), "tasks.json"), { tasks });
-    return { ok: true, task, warnings, notified, bouncedTaskId, acceptedTaskId };
+    return { ok: true, task, warnings, notified, bouncedTaskId, acceptedTaskId, lowConfidence, researchTaskId };
   });
 }
 

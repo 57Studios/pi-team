@@ -243,6 +243,40 @@ const main = async () => {
     fs.rmSync(root2, { recursive: true, force: true });
   });
 
+  await t("confidence parsing + low-confidence escalation", async () => {
+    ok("parse: low word", bus.parseConfidence("low") === "low");
+    ok("parse: negation", bus.parseConfidence("not confident") === "low");
+    ok("parse: medium", bus.parseConfidence("moderate") === "medium");
+    ok("parse: high", bus.parseConfidence("high") === "high");
+    ok("parse: percent", bus.parseConfidence("72%") === "medium");
+    ok("parse: 0-1 score", bus.parseConfidence("0.9") === "high");
+    ok("parse: blank -> null", bus.parseConfidence("") === null);
+
+    const root2 = path.join(root, "conf");
+    await bus.createTeam(root2, "c", {});
+    await bus.joinMember(root2, "c", { id: "coord", name: "Alice", role: "coordinator" });
+    await bus.joinMember(root2, "c", { id: "imp", name: "Bob", role: "implementer" });
+    await bus.joinMember(root2, "c", { id: "res", name: "Ghost", role: "researcher" });
+    const t = await bus.createTask(root2, "c", { title: "parser", assignee: "role:implementer", createdBy: "coord", createdByName: "Alice" });
+
+    // high confidence -> no escalation
+    const hi = await bus.updateTask(root2, "c", t.task.id, { status: "done", evidence: "works", confidence: "high" }, { id: "imp", name: "Bob", role: "implementer" });
+    ok("high confidence: no escalation", hi.ok && hi.lowConfidence !== true);
+
+    // low confidence -> coordinator notified + research task created for researcher
+    const t2 = await bus.createTask(root2, "c", { title: "config parser", assignee: "role:implementer", createdBy: "coord", createdByName: "Alice" });
+    const lo = await bus.updateTask(root2, "c", t2.task.id, { status: "done", evidence: "mostly works", confidence: "low" }, { id: "imp", name: "Bob", role: "implementer" });
+    ok("low confidence flagged", lo.ok && lo.lowConfidence === true && lo.researchTaskId);
+    const tasks = await bus.loadTasks(root2, "c");
+    const research = tasks.find((x) => x.id === lo.researchTaskId);
+    ok("research follow-up created", research && research.assignee === "role:researcher" && research.dependsOn.includes(t2.task.id));
+    const coordIn = await bus.drainInbox(root2, "c", "coord");
+    ok("coordinator got LOW CONFIDENCE notice", coordIn.some((m) => m.type === "task_low_confidence" && m.body.includes(lo.researchTaskId)));
+    const resIn = await bus.drainInbox(root2, "c", "res");
+    ok("researcher got the follow-up task", resIn.some((m) => m.type === "task" && m.body.includes(lo.researchTaskId)));
+    fs.rmSync(root2, { recursive: true, force: true });
+  });
+
   await t("concurrent joins do not lose members", async () => {
     const root2 = path.join(root, "concurrent");
     await bus.createTeam(root2, "team2", {});

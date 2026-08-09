@@ -51,14 +51,15 @@ injected at the start of his next turn, does the work, and sends
 
 ## What each side sees
 
-- **Standing briefing (every agent run)** — each time an agent runs (every
-  user prompt, queued follow-up, or auto-triggered turn), its run starts with
+- **Standing briefing (injected when needed)** — each agent run starts with
   a `[team-context]` block: who they are, the team mission, who they report to
-  (derived from the `coordinator` role), and where completed work goes next
-  (derived from the `reviewer` role). The block is persistent in context for
-  the whole run, and re-injected at the start of each new run so it survives
-  compaction and never decays. It is not re-sent between individual tool calls
-  within a run. The mission is set by the coordinator:
+  (derived from the `coordinator` role), where completed work goes next
+  (derived from the `reviewer` role), and the team protocol. It is **injected
+  only when necessary**: the first run of a session, after compaction
+  (`session_compact` marks it dirty), or when role/mission/roster changes —
+  steady state costs **zero tokens** per prompt, but it can never decay.
+  Offline members are marked `(offline)` in the roster so agents don't DM
+  ghosts. The mission is set by the coordinator:
   `team briefing --body "..."` / `/team briefing --body "..."`.
 - **New DM while idle** → TUI notification (`[team:invader] 1 new message(s)...`).
 - **New DM at the start of a turn** → auto-injected into context as a
@@ -155,8 +156,12 @@ their "typed artifacts on a DAG" without an engine:
   This is jcode's critique gate, made concrete.
 - **Escalation is automatic**: blocked/failed tasks notify the coordinator
   (fallback: the creator); completed tasks notify the creator; bounces notify
-  the implementer. Notifications are atomic with the transition — no missed
-  handoffs.
+  the implementer; **LOW-confidence completions** (`--confidence low` on
+  `task_done`, leniently parsed — words or scores like `0.7` / `70%`) notify
+  the coordinator *and* auto-create a research follow-up task assigned to
+  `role:researcher` (fallback: coordinator), so uncertainty becomes structured
+  work instead of a footnote. Notifications are atomic with the transition —
+  no missed handoffs.
 - **Permissions are light and social**: assignee/role/coordinator can change
   status; unassigned tasks are claimable by anyone; only creator/coordinator
   can reassign; a same-role reviewer gets a warning.

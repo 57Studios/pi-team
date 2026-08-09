@@ -49,6 +49,10 @@ export default function (pi: ExtensionAPI) {
   let watcher: fs.FSWatcher | undefined;
   let heartbeat: NodeJS.Timeout | undefined;
   let lastTouchAt = 0;
+  // Standing-briefing injection state: inject on the first run of a session,
+  // after compaction, or when the briefing content changed — not every prompt.
+  let lastBriefingHash: number | null = null;
+  let briefingDirty = false;
   const autoTurns: number[] = [];
 
   // -------------------------------------------------------------------------
@@ -162,25 +166,31 @@ export default function (pi: ExtensionAPI) {
     brief: string | null,
   ): string {
     const roster = bus.rosterList(members, me.id);
-    const coordinators = roster.filter((m) => bus.hasRole(m.role, "coordinator")).map((m) => m.name);
-    const reviewers = roster.filter((m) => bus.hasRole(m.role, "reviewer")).map((m) => m.name);
-    const researchers = roster.filter((m) => bus.hasRole(m.role, "researcher")).map((m) => m.name);
+    const now = Date.now();
+    const dead = (m: any) => m.status === "offline" || now - (m.lastSeen || 0) > bus.STALE_MEMBER_MS;
+    const mark = (m: any) => `${m.name}(${m.role}${dead(m) ? ", offline" : ""})`;
+    const coordinators = roster.filter((m) => bus.hasRole(m.role, "coordinator"));
+    const reviewers = roster.filter((m) => bus.hasRole(m.role, "reviewer"));
+    const researchers = roster.filter((m) => bus.hasRole(m.role, "researcher"));
+    const coordNames = coordinators.map(mark).join(", ");
+    const revNames = reviewers.map(mark).join(", ");
+    const resNames = researchers.map(mark).join(", ");
     const amResearcher = bus.hasRole(me.role, "researcher");
     const lines = [`You are ${me.name} (${me.role}) in team "${me.team}".`];
     if (brief?.trim()) {
       lines.push(`Mission: ${brief.trim()}`);
     } else {
-      lines.push(`Mission: not set yet — ask the coordinator${coordinators.length ? ` (${coordinators.join(", ")})` : ""} for the team's objectives, or check the board.`);
+      lines.push(`Mission: not set yet — ask the coordinator${coordinators.length ? ` (${coordNames})` : ""} for the team's objectives, or check the board.`);
     }
     if (roster.length) {
-      lines.push(`Team: ${roster.map((m) => `${m.name}(${m.role})`).join(", ")}`);
+      lines.push(`Team: ${roster.map(mark).join(", ")}`);
     }
     lines.push(
-      `Report to: role:coordinator${coordinators.length ? ` (${coordinators.join(", ")})` : ""} — use team report for completion reports; task_blocked/task_fail auto-notify them.`,
+      `Report to: role:coordinator${coordinators.length ? ` (${coordNames})` : ""} — use team report for completion reports; task_blocked/task_fail auto-notify them.`,
     );
     if (reviewers.length) {
       lines.push(
-        `Pass completed work to: role:reviewer (${reviewers.join(", ")}) — created review tasks land there and bounce failed work back to you.`,
+        `Pass completed work to: role:reviewer (${revNames}) — created review tasks land there and bounce failed work back to you.`,
       );
     } else {
       lines.push("No reviewers on this team — the coordinator reviews completed work.");
@@ -189,7 +199,7 @@ export default function (pi: ExtensionAPI) {
     lines.push("Protocol:");
     if (amResearcher) {
       lines.push(
-        `- Your duty: when any member DMs you a research request, investigate thoroughly, send the FULL report back to the requester, and send a one-line tldr to role:coordinator${coordinators.length ? ` (${coordinators.join(", ")})` : ""}. Explicitly flag anything you could not verify.`,
+        `- Your duty: when any member DMs you a research request, investigate thoroughly, send the FULL report back to the requester, and send a one-line tldr to role:coordinator${coordinators.length ? ` (${coordNames})` : ""}. Explicitly flag anything you could not verify.`,
       );
       lines.push("- If your work crosses another member's path, DM them directly to coordinate.");
       lines.push("- If you feel uncertain about anything, say so explicitly in your report and note what you could not verify.");
@@ -199,7 +209,7 @@ export default function (pi: ExtensionAPI) {
       );
       if (researchers.length) {
         lines.push(
-          `- Research: whenever you need something searched, investigated, or fact-checked, DM role:researcher (${researchers.join(", ")}) with the question. They send the full report back to you and a tldr to the coordinator.`,
+          `- Research: whenever you need something searched, investigated, or fact-checked, DM role:researcher (${resNames}) with the question. They send the full report back to you and a tldr to the coordinator.${researchers.length && researchers.every(dead) ? " The researcher is currently offline — ask the coordinator to wake them (team revive)." : ""}`,
         );
         lines.push(
           "- Confidence: if you feel uncertain about a design, a dependency, or any fact, immediately ask the researcher to investigate before proceeding — do not guess.",
@@ -211,6 +221,12 @@ export default function (pi: ExtensionAPI) {
       }
     }
     return lines.join("\n");
+  }
+
+  function hashStr(s: string): number {
+    let h = 5381;
+    for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+    return h;
   }
 
   function formatMessages(msgs: Array<Record<string, any>>): string {
@@ -226,7 +242,9 @@ export default function (pi: ExtensionAPI) {
                 ? "TASK FAILED"
                 : m.type === "task_bounced"
                   ? "REVIEW FAILED"
-                  : m.type === "report"
+                  : m.type === "task_low_confidence"
+                    ? "LOW CONFIDENCE"
+                    : m.type === "report"
                     ? "REPORT"
                     : m.type === "broadcast"
                       ? "BROADCAST"
@@ -380,9 +398,16 @@ export default function (pi: ExtensionAPI) {
   // lifecycle
   // -------------------------------------------------------------------------
 
+  pi.on("session_compact", () => {
+    // Compaction summarized away context — the standing briefing must return.
+    briefingDirty = true;
+  });
+
   pi.on("session_start", async (_event, c) => {
     ctx = c;
     lastTouchAt = 0;
+    lastBriefingHash = null;
+    briefingDirty = false;
     const me = await myTeam(c);
     if (me) {
       startWatcher(me);
@@ -421,19 +446,27 @@ export default function (pi: ExtensionAPI) {
     const msgs = await bus.drainInbox(me.root, me.team, me.id);
     const members = await bus.loadMembers(me.root, me.team);
     const brief = await bus.loadBrief(me.root, me.team);
-    // Injected every turn so the role/mission/handoff protocol is standing
-    // context: it survives compaction and can never decay.
-    const briefing = buildBriefing(me, members, brief);
+    const briefingBlock = `[team-context] ${buildBriefing(me, members, brief)}`;
+    const briefingHash = hashStr(briefingBlock);
+    // Inject only when needed: first run of a session, after compaction, or
+    // when role/mission/roster changed. Steady state costs zero tokens and
+    // the briefing still lives in context (it was already injected). Compaction
+    // is the only way pi prunes context, and it fires session_compact below.
+    const injectBriefing =
+      lastBriefingHash === null || briefingDirty || briefingHash !== lastBriefingHash;
     const parts: string[] = [];
     if (msgs.length) parts.push(formatMessages(msgs));
-    parts.push(`[team-context] ${briefing}`);
+    if (injectBriefing) {
+      lastBriefingHash = briefingHash;
+      briefingDirty = false;
+      parts.push(briefingBlock);
+    }
+    if (!parts.length) return;
     return {
       message: {
         customType: "team-briefing",
         content: parts.join("\n\n"),
-        // DMs are worth showing in the transcript; the standing briefing is
-        // context-only so the TUI doesn't repeat it on every turn.
-        display: msgs.length > 0,
+        display: true,
       },
     };
   });
@@ -480,7 +513,7 @@ export default function (pi: ExtensionAPI) {
       root,
       me.team,
       tid,
-      { status: to, reason: p.body, evidence: p.evidence, depOverride: p.dep_override },
+      { status: to, reason: p.body, evidence: p.evidence, depOverride: p.dep_override, confidence: p.confidence },
       { id: me.id, name: me.name, role: me.role },
     );
     if (!res.ok) return `error: ${res.error}`;
@@ -493,6 +526,9 @@ export default function (pi: ExtensionAPI) {
     }
     if (res.acceptedTaskId) {
       out += `\nTask ${res.acceptedTaskId} accepted (review passed) and its creator was notified.`;
+    }
+    if (res.lowConfidence) {
+      out += `\nLow confidence flagged — the coordinator was notified and research follow-up task ${res.researchTaskId || "(none available)"} was auto-created to shore it up.`;
     }
     if (res.notified) {
       out += ` Notified ${res.notified} recipient(s).`;
@@ -838,6 +874,7 @@ export default function (pi: ExtensionAPI) {
       evidence: Type.Optional(Type.String({ description: "Required for task_done: what changed (file refs), validation run." })),
       depends_on: Type.Optional(Type.Array(Type.String(), { description: "Task ids this task depends on (task_create)." })),
       dep_override: Type.Optional(Type.String({ description: "Reason to complete a task despite unfinished dependencies (task_done)." })),
+      confidence: Type.Optional(Type.String({ description: "Optional self-reported confidence for task_done: low|medium|high (or a score like 0.8 / 70%). LOW auto-notifies the coordinator and creates a research follow-up task." })),
       kind: Type.Optional(StringEnum(["work", "review"] as const)),
       review_of: Type.Optional(Type.String({ description: "For kind=review: the task id being reviewed. Failing the review bounces it back to running." })),
       priority: Type.Optional(StringEnum(["normal", "high"] as const)),
