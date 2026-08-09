@@ -213,6 +213,19 @@ export async function setTeamSetting(root, team, patch) {
     const meta = await readJson(file, {});
     if (patch.autoRespond !== undefined) meta.autoRespond = Boolean(patch.autoRespond);
     if (patch.interject !== undefined) meta.interject = Boolean(patch.interject);
+    if (patch.autoTimers !== undefined) {
+      // Standing cadence timers: [{ name, minutes, body, tag }] — the
+      // extension auto-arms them for the matching member at session start
+      // and re-arms after each fire. No model cooperation needed.
+      meta.autoTimers = (Array.isArray(patch.autoTimers) ? patch.autoTimers : [])
+        .filter((a) => a && a.name)
+        .map((a) => ({
+          name: String(a.name).trim(),
+          minutes: Math.max(1, Number(a.minutes) || 15),
+          body: String(a.body || "").slice(0, 500),
+          tag: String(a.tag || `${a.name}_${Date.now()}`).slice(0, 60),
+        }));
+    }
     await writeJsonAtomic(file, meta);
     return { ok: true, team: meta };
   });
@@ -376,7 +389,7 @@ async function writeTimers(root, team, all) {
   await writeJsonAtomic(timersFile(root, team), all);
 }
 
-export async function setTimer(root, team, memberId, { minutes, at, body }) {
+export async function setTimer(root, team, memberId, { minutes, at, body, tag }) {
   const now = Date.now();
   let dueAt = null;
   if (at) {
@@ -396,7 +409,7 @@ export async function setTimer(root, team, memberId, { minutes, at, body }) {
   }
   const all = await readTimers(root, team);
   const timers = (all[memberId] ||= []);
-  const t = { id: `t_${Date.now()}_${randomUUID().slice(0, 4)}`, dueAt, body: String(body || "").slice(0, 500), createdAt: now };
+  const t = { id: `t_${Date.now()}_${randomUUID().slice(0, 4)}`, dueAt, body: String(body || "").slice(0, 500), createdAt: now, tag: tag || null };
   timers.push(t);
   timers.sort((a, b) => a.dueAt - b.dueAt);
   await writeTimers(root, team, all);

@@ -490,6 +490,25 @@ const main = async () => {
     fs.rmSync(root2, { recursive: true, force: true });
   });
 
+  await t("standing cadence timers (autoTimers config)", async () => {
+    const root2 = path.join(root, "stt");
+    await bus.createTeam(root2, "s", {});
+    const res = await bus.setTeamSetting(root2, "s", { autoTimers: [
+      { name: "Zed", minutes: 15, tag: "zed_cycle", body: "run the next cycle" },
+      { name: "Daisy", minutes: 30, tag: "daisy_scout", body: "scout scan" },
+      { name: "", minutes: 5, body: "bad" }, // filtered: no name
+    ] });
+    ok("autoTimers stored", res.ok && res.team.autoTimers.length === 2);
+    ok("minutes clamped", res.team.autoTimers[0].minutes === 15);
+    ok("tag kept", res.team.autoTimers[1].tag === "daisy_scout");
+    // setTimer stores the tag so the extension can dedup/re-arm
+    const t = await bus.setTimer(root2, "s", "a", { minutes: 15, body: "cycle", tag: "zed_cycle" });
+    ok("tag persisted on timer", t.ok && t.timer.tag === "zed_cycle");
+    const claimed = await bus.claimDueTimers(root2, "s", "a", Date.now() + 1e12);
+    ok("claimed timer keeps tag", claimed.length === 1 && claimed[0].tag === "zed_cycle");
+    fs.rmSync(root2, { recursive: true, force: true });
+  });
+
   await t("project memory (MEMORY.md)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memo-"));
     // first append seeds the header

@@ -274,6 +274,24 @@ export default function (pi: ExtensionAPI) {
     await bus.touchMember(me.root, me.team, me.id).catch(() => {});
   }
 
+  // Standing cadence timers from team.json (autoTimers): auto-arm the ones
+  // matching me at session start, and re-arm after each fire so the cadence
+  // continues with zero model cooperation. Dedup: never two pending with the
+  // same tag.
+  async function armAutoTimers(me: NonNullable<Awaited<ReturnType<typeof myTeam>>>) {
+    try {
+      const meta = await bus.loadTeam(me.root, me.team);
+      const autos: Array<{ name: string; minutes: number; body: string; tag: string }> =
+        (meta as any)?.autoTimers || [];
+      for (const a of autos) {
+        if (a.name !== me.name) continue;
+        const pending = await bus.listTimers(me.root, me.team, me.id);
+        if (pending.some((t: any) => t.tag === a.tag)) continue;
+        await bus.setTimer(me.root, me.team, me.id, { minutes: a.minutes, body: a.body, tag: a.tag });
+      }
+    } catch { /* best effort */ }
+  }
+
   // Arm persisted self-ping timers: due ones fire now (missed while offline),
   // future ones schedule a wake. Called on session_start after joining.
   const pendingTimerTimeouts: NodeJS.Timeout[] = [];
@@ -290,9 +308,16 @@ export default function (pi: ExtensionAPI) {
         { triggerTurn: true, deliverAs: "followUp" },
       );
     };
+    // After a fire, standing cadence continues: re-create the next timer AND
+    // schedule its timeout (armTimers claims-due + schedules all pending).
+    const rearm = async () => {
+      await armAutoTimers(me);
+      await armTimers(me);
+    };
     try {
       const due = await bus.claimDueTimers(me.root, me.team, me.id);
       for (const t of due) fire(t);
+      if (due.length) await rearm();
       const future = await bus.listTimers(me.root, me.team, me.id);
       for (const t of future) {
         const wait = Math.max(1000, t.dueAt - Date.now());
@@ -300,6 +325,7 @@ export default function (pi: ExtensionAPI) {
           try {
             const claimed = await bus.claimDueTimers(me.root, me.team, me.id, t.dueAt + 1);
             for (const ct of claimed) fire(ct);
+            if (claimed.length) await rearm();
           } catch { /* best effort */ }
         }, wait);
         pendingTimerTimeouts.push(to);
@@ -603,6 +629,9 @@ export default function (pi: ExtensionAPI) {
     const me = await myTeam(c);
     if (me) {
       startWatcher(me);
+      // auto-arm standing timers first: armTimers schedules timeouts for
+      // whatever timers already exist, so the standing ones must exist first.
+      await armAutoTimers(me);
       await armTimers(me);
       applyTitle(c, me);
       await seedMemo(c, me);
@@ -1138,6 +1167,26 @@ export default function (pi: ExtensionAPI) {
           const res = await bus.setTeamSetting(root, me.team, { autoRespond: p.auto_respond === true });
           return `autoRespond is now ${res.team.autoRespond ? "ON" : "OFF"} (default ON). When ON, idle members auto-start a turn for any new message (rate-limited ~3/min); set false if you want to read messages only on your own prompt.`;
         }
+        if (p.auto_timers !== undefined) {
+          if (!bus.hasRole(me.role, "coordinator")) {
+            return "error: only a coordinator can change team settings.";
+          }
+          // Format: "Zed:15:run the next cycle;Daisy:30:scout scan"
+          const parsed = String(p.auto_timers)
+            .split(";")
+            .map((pair) => pair.trim())
+            .filter(Boolean)
+            .map((pair) => {
+              const m = pair.match(/^([^:]+):(\d+):(.*)$/);
+              return m ? { name: m[1].trim(), minutes: Number(m[2]), body: m[3].trim(), tag: m[1].trim().toLowerCase() } : null;
+            })
+            .filter(Boolean);
+          if (!parsed.length) return "error: bad auto_timers format (use \"Name:minutes:body;Name2:30:body2\").";
+          const res = await bus.setTeamSetting(root, me.team, { autoTimers: parsed });
+          await armAutoTimers(me);
+          await armTimers(me);
+          return `Standing timers set for ${parsed.map((a) => a.name).join(", ")} — they auto-arm at session start and re-arm after each fire.`;
+        }
         const meta = await bus.loadTeam(root, me.team);
         return `Team "${me.team}" — autoRespond: ${meta?.autoRespond} | interject: ${meta?.interject}. Set with team config --auto_respond true|false.`;
       }
@@ -1242,6 +1291,7 @@ export default function (pi: ExtensionAPI) {
       minutes: Type.Optional(Type.Number({ description: "For later: ping me in this many minutes." })),
       at: Type.Optional(Type.String({ description: "For later: ping me at this 24h time (HH:MM, e.g. 14:30)." })),
       cancel: Type.Optional(Type.String({ description: "For later: cancel a timer by id." })),
+      auto_timers: Type.Optional(Type.String({ description: "For config (coordinator): standing cadence timers 'Name:minutes:body;Name2:30:body2' — auto-armed at session start, re-armed after each fire." })),
       timeout_minutes: Type.Optional(Type.Number({ description: "For await_members: max minutes to wait (1-30, default 3)." })),
       mode: Type.Optional(StringEnum(["all", "any"] as const)),
       preset: Type.Optional(Type.Array(Type.Object({ name: Type.String(), role: Type.Optional(Type.String()) }), { description: "For preset_create: the roster, e.g. [{name:'Optimus', role:'coordinator, reviewer'}, ...]. Roles may be comma-separated." })),
@@ -1550,10 +1600,28 @@ export default function (pi: ExtensionAPI) {
               const res = await bus.setTeamSetting(root, me.team, { autoRespond: on });
               return notify(`autoRespond is now ${on ? "ON" : "OFF"} — idle members ${on ? "will" : "won't"} auto-start turns on DMs; wake-marked messages (dm --wake) always wake.`);
             }
+            const at = argv["auto-timers"];
+            if (at !== undefined) {
+              if (!bus.hasRole(me.role, "coordinator")) return notify("Only a coordinator can change team settings.");
+              const parsed = String(at)
+                .split(";")
+                .map((pair) => pair.trim())
+                .filter(Boolean)
+                .map((pair) => {
+                  const m = pair.match(/^([^:]+):(\d+):(.*)$/);
+                  return m ? { name: m[1].trim(), minutes: Number(m[2]), body: m[3].trim(), tag: m[1].trim().toLowerCase() } : null;
+                })
+                .filter(Boolean);
+              if (!parsed.length) return notify("error: bad --auto-timers format (use \"Name:minutes:body;Name2:30:body2\").");
+              const res = await bus.setTeamSetting(root, me.team, { autoTimers: parsed });
+              await armAutoTimers(me);
+              return notify(`Standing timers set for ${parsed.map((a) => a.name).join(", ")} — auto-armed at session start, re-armed after each fire.`);
+            }
             const meta = await bus.loadTeam(root, me.team);
             const members = await bus.loadMembers(root, me.team);
+            const atList = (meta?.autoTimers || []).map((a: any) => `${a.name}:${a.minutes}m:${a.body.slice(0, 30)}`).join(" | ") || "(none)";
             return notify(
-              `Team "${me.team}" @ ${me.dir}\nautoRespond: ${meta?.autoRespond} | interject: ${meta?.interject}\nMembers: ${Object.keys(members).length}\nYou: ${me.name} (${me.role})`,
+              `Team "${me.team}" @ ${me.dir}\nautoRespond: ${meta?.autoRespond} | interject: ${meta?.interject}\nstanding timers: ${atList}\nMembers: ${Object.keys(members).length}\nYou: ${me.name} (${me.role})`,
             );
           }
           case "selftest": {

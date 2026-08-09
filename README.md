@@ -114,6 +114,10 @@ with other harnesses' root-level `MEMORY.md` / `AGENTS.md` conventions:
   `--at HH:MM`, `/team timers`, `/team later --cancel <id>`) — the model asks
   the harness to ping it: a persisted timer fires a wake turn at the due time
   (survives restarts; a missed timer fires on the next session start).
+- **Standing cadence timers** (`/team config --auto-timers "Zed:15:run the
+  next cycle;Daisy:30:scout scan"`, coordinator-only) — auto-armed at each
+  member's session start and re-armed after every fire, so a recurring cadence
+  (Zilla's 15-min cycle, 30-min scout scan) runs with zero model cooperation.
 - **`team checkin`** (or `/team checkin [names...] [--body Q]`) — the
   **non-blocking** status check: wake-DMs everyone, you END YOUR TURN, and
   each reply auto-wakes you with injected progress (`[team-checkin] 2/5
