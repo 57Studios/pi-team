@@ -35,6 +35,7 @@ const ACTIONS = [
   "inbox", "board_write", "board_read", "status", "whoami", "set_role",
   "spawn", "selftest",
   "task_create", "task_list", "task_show", "task_start", "task_done", "task_blocked", "task_fail", "task_assign",
+  "preset_show", "preset_save", "revive",
 ] as const;
 
 const TEAM_IDENTITY_ENTRY = "team-identity";
@@ -46,6 +47,7 @@ export default function (pi: ExtensionAPI) {
   // (roster hygiene for teammates) without a full identity re-resolution.
   let lastTeam: { root: string; team: string; id: string } | undefined;
   let watcher: fs.FSWatcher | undefined;
+  let heartbeat: NodeJS.Timeout | undefined;
   let lastRosterLine = "";
   let lastTouchAt = 0;
   const autoTurns: number[] = [];
@@ -185,6 +187,10 @@ export default function (pi: ExtensionAPI) {
   }
 
   function stopWatcher() {
+    if (heartbeat) {
+      clearInterval(heartbeat);
+      heartbeat = undefined;
+    }
     if (watcher) {
       try {
         watcher.close();
@@ -218,6 +224,13 @@ export default function (pi: ExtensionAPI) {
     }
     let timer: NodeJS.Timeout | undefined;
     let busy = false;
+    // Heartbeat while in a team: lastSeen is a real liveness signal, so a
+    // crashed/power-loss session releases its name once the heartbeat goes
+    // stale (STALE_MEMBER_MS) and the team can be revived cleanly.
+    if (heartbeat) clearInterval(heartbeat);
+    heartbeat = setInterval(() => {
+      bus.touchMember(me.root, me.team, me.id).catch(() => {});
+    }, bus.HEARTBEAT_MS);
     watcher = fs.watch(dir, () => {
       if (timer) clearTimeout(timer);
       timer = setTimeout(async () => {
@@ -635,6 +648,47 @@ export default function (pi: ExtensionAPI) {
         return `Role updated to ${res.member.role}.`;
       }
 
+      case "preset_show": {
+        if (!me) return notInTeam;
+        const preset = await bus.loadPreset(root, me.team);
+        if (!preset?.members?.length) {
+          return "No preset for this team. Members are added to the preset automatically when they join (name + role); it survives crashes and power loss.";
+        }
+        return `Team preset "${me.team}" (${preset.members.length} member(s)):\n${preset.members.map((m) => `- ${m.name} (${m.role})`).join("\n")}\n\nRevive it with team revive, or refresh with team preset_save.`;
+      }
+
+      case "preset_save": {
+        if (!me) return notInTeam;
+        await bus.refreshPresetFromRoster(root, me.team);
+        return "Preset refreshed from the current roster.";
+      }
+
+      case "revive": {
+        if (!me) return notInTeam;
+        const preset = await bus.loadPreset(root, me.team);
+        if (!preset?.members?.length) return "error: no preset for this team (members are added on join).";
+        const members = await bus.loadMembers(root, me.team);
+        const now = Date.now();
+        const spawned: string[] = [];
+        const skipped: string[] = [];
+        for (const m of preset.members) {
+          const live = Object.values(members).some(
+            (x: any) => x.name === m.name && x.status !== "offline" && now - (x.lastSeen || 0) < bus.STALE_MEMBER_MS,
+          );
+          if (live) {
+            skipped.push(m.name);
+            continue;
+          }
+          await spawnWorker(me, { role: m.role, name: m.name, prompt: p.prompt }, c);
+          spawned.push(m.name);
+        }
+        return (
+          `Reviving team "${me.team}"...\nSpawned: ${spawned.join(", ") || "(none)"}\n` +
+          `Already live (skipped): ${skipped.join(", ") || "(none)"}\n` +
+          `Each spawns with PI_TEAM=${me.team} and auto-joins with its preset name/role.`
+        );
+      }
+
       case "spawn": {
         if (!me) return notInTeam;
         return spawnWorker(me, p, c);
@@ -652,7 +706,7 @@ export default function (pi: ExtensionAPI) {
     name: "team",
     label: "Team",
     description:
-      "Coordinate with other pi agents in your team (like a company): join teams, DM teammates, assign tasks, post reports, share a board, and track a structured task board. Actions: create, join, leave, roster, dm, broadcast, task, report, inbox, board_write, board_read, status, whoami, set_role, spawn, selftest, task_create, task_list, task_show, task_start, task_done, task_blocked, task_fail, task_assign. Address recipients by member name or role:<role> (e.g. role:implementer). Reports go to role:coordinator by default. Tasks live on the team board; completing one REQUIRES evidence, is blocked on unfinished dependencies unless dep_override, and kind=review tasks gate a reviewed task (failure bounces it back to running).",
+      "Coordinate with other pi agents in your team (like a company): join teams, DM teammates, assign tasks, post reports, share a board, and track a structured task board. Actions: create, join, leave, roster, dm, broadcast, task, report, inbox, board_write, board_read, status, whoami, set_role, spawn, selftest, task_create, task_list, task_show, task_start, task_done, task_blocked, task_fail, task_assign, preset_show, preset_save, revive. Address recipients by member name or role:<role> (e.g. role:implementer). Reports go to role:coordinator by default. Tasks live on the team board; completing one REQUIRES evidence, is blocked on unfinished dependencies unless dep_override, and kind=review tasks gate a reviewed task (failure bounces it back to running).",
     promptSnippet: "Coordinate with teammate pi agents via team: DM, assign tasks, post reports, share a board, track tasks",
     promptGuidelines: [
       "Use team when the user wants multiple agents to work together or you need help from a teammate.",
@@ -794,9 +848,51 @@ export default function (pi: ExtensionAPI) {
             const me = await myTeam(c);
             if (!me) return notify("You are not in a team.");
             const hours = parseFloat(argv.hours || argv._[1] || "24");
-            if (!hours || hours <= 0) return notify("Usage: /team prune [--hours N] (default 24)");
-            const res = await bus.pruneMembers(root, me.team, { olderThanMs: hours * 3_600_000 });
-            return notify(`Pruned ${res.removed} member(s) last seen more than ${hours}h ago.`);
+            // --hours 0 reaps dead sessions immediately (heartbeat gone / offline),
+            // safe because live members heartbeat every 60s.
+            const olderThanMs = hours > 0 ? hours * 3_600_000 : 3 * 60_000;
+            const res = await bus.pruneMembers(root, me.team, { olderThanMs });
+            return notify(`Pruned ${res.removed} member(s) last seen more than ${hours > 0 ? hours + "h" : "3 min (dead)"} ago.`);
+          }
+          case "preset": {
+            const me = await myTeam(c);
+            if (!me) return notify("You are not in a team.");
+            const sub = argv._[1] || "show";
+            if (sub === "save") {
+              await bus.refreshPresetFromRoster(root, me.team);
+              return notify("Preset refreshed from the current roster.");
+            }
+            const preset = await bus.loadPreset(root, me.team);
+            if (!preset?.members?.length) return notify("No preset yet — members are added automatically on join.");
+            return notify(
+              `Team preset "${me.team}" (${preset.members.length}):\n` +
+                preset.members.map((m) => `- ${m.name} (${m.role})`).join("\n") +
+                `\n\nBring the team back with /team revive`,
+            );
+          }
+          case "revive": {
+            const me = await myTeam(c);
+            if (!me) return notify("You are not in a team.");
+            const preset = await bus.loadPreset(root, me.team);
+            if (!preset?.members?.length) return notify("No preset for this team (members are added on join).");
+            const members = await bus.loadMembers(root, me.team);
+            const now = Date.now();
+            const spawned: string[] = [];
+            const skipped: string[] = [];
+            for (const m of preset.members) {
+              const live = Object.values(members).some(
+                (x: any) => x.name === m.name && x.status !== "offline" && now - (x.lastSeen || 0) < bus.STALE_MEMBER_MS,
+              );
+              if (live) {
+                skipped.push(m.name);
+                continue;
+              }
+              await spawnWorker(me, { role: m.role, name: m.name, prompt: argv.prompt }, c);
+              spawned.push(m.name);
+            }
+            return notify(
+              `Reviving "${me.team}": spawned ${spawned.join(", ") || "(none)"} · already live: ${skipped.join(", ") || "(none)"}`,
+            );
           }
           case "inbox": {
             const me = await myTeam(c);
@@ -846,7 +942,9 @@ export default function (pi: ExtensionAPI) {
               "/team tasks                                   show the task board",
               "/team inbox                                   read pending messages",
               "/team set-role <role> / set-name <name>       update your role/name",
-              "/team prune [--hours N]                       remove members last seen > N h ago (default 24)",
+              "/team prune [--hours N]                       remove dead members (0 = dead only, default 24h)",
+              "/team preset [save]                           show/refresh the saved team (name + role)",
+              "/team revive [--prompt ...]                   spawn the whole preset team back in terminals",
               "/team config                                  show team settings",
               "/team selftest                                run bus self-tests",
               "",
@@ -1047,6 +1145,12 @@ export default function (pi: ExtensionAPI) {
       fs.utimesSync(tmpFile, old, old);
       await bus.sweepTeam(root, "acme");
       ok("sweep removes stale tmp files", !fs.existsSync(tmpFile));
+      // dead-session reclaim + preset
+      bus.setMemberStatusSync(root, "acme", "sessA", "offline");
+      const re = await bus.joinMember(root, "acme", { id: "sessA2", name: "Alice", role: "coordinator" });
+      ok("offline session name reclaimed", re.ok);
+      const preset = await bus.loadPreset(root, "acme");
+      ok("preset tracks roster", preset && preset.members.some((m) => m.name === "Alice"));
       return "SELFTEST: " + log.join(" | ");
     } catch (e: any) {
       return "SELFTEST FAIL: " + (e?.message ?? e) + " | " + log.join(" | ");

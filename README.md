@@ -125,10 +125,38 @@ their "typed artifacts on a DAG" without an engine:
 /team tasks                                    show the task board
 /team inbox                                    read pending messages
 /team set-role <role>   /team set-name <name>  change your role/name
-/team prune [--hours N]                             remove members last seen > N h ago (default 24)
+/team prune [--hours N]                             remove dead members (0 = dead only, default 24h)
+/team preset [save]                             show/refresh the saved team (name + role)
+/team revive [--prompt ...]                     spawn the whole preset team back in terminals
 /team config                                   team settings (autoRespond, interject)
 /team selftest                                 run the built-in self tests
 ```
+
+## Crash recovery & the team preset
+
+**Power loss / crash-safe names.** Every member heartbeats (`lastSeen` touched
+every 60s while running) and marks itself `offline` on graceful close. A name
+is only "taken" by a **live** member; a dead session (crash, power loss, closed
+terminal) releases its name automatically once its heartbeat goes stale
+(~5 min), or immediately if it shut down gracefully. So after a power cut you
+can rejoin with the same name — no manual cleanup. `prune --hours 0` reaps
+dead sessions right away.
+
+**Team preset ("call the team back").** The team directory keeps a
+`preset.json` — the *intended* roster (name + role), auto-updated whenever
+someone joins, leaves, or changes role. It's plain disk state, so it survives
+crashes. When you want the whole team back:
+
+```
+/team revive            # coordinator: opens a terminal per preset member
+/team preset            # see who's in the preset
+/team preset save       # refresh it from the current live roster
+```
+
+`revive` skips members who are already live, and spawns the rest in new
+terminals with their preset name/role baked into the env — they auto-join
+on startup. Agents can do the same via `team revive` / `team preset_show` /
+`team preset_save`.
 
 ## Housekeeping (automatic + on demand)
 
@@ -139,7 +167,8 @@ Storage can't grow unboundedly:
 - **Temp-file sweep**: stale `*.tmp-*` files (from a killed writer) older
   than 1h are removed automatically.
 - **Dead-member pruning**: members last seen > 7 days ago are pruned
-automatically; run `/team prune [--hours N]` to sweep sooner (default 24h).
+automatically; `/team prune [--hours N]` sweeps sooner (default 24h,
+`--hours 0` reaps dead sessions immediately).
 - The sweep runs ~1/hour per instance while in a team (throttled, cheap).
 
 ## UI

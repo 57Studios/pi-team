@@ -185,6 +185,36 @@ const main = async () => {
     ok("log has message event", log.some((e) => e.event === "message"));
   });
 
+  await t("dead-session name reclaim + team preset", async () => {
+    const root2 = path.join(root, "reclaim");
+    await bus.createTeam(root2, "team3", {});
+    await bus.joinMember(root2, "team3", { id: "old-session", name: "Zed", role: "architect" });
+    // graceful shutdown marks offline -> name is immediately reclaimable
+    bus.setMemberStatusSync(root2, "team3", "old-session", "offline");
+    const jr1 = await bus.joinMember(root2, "team3", { id: "new-session", name: "Zed", role: "architect" });
+    ok("offline session name reclaimed on rejoin", jr1.ok);
+    // a live member's name is NOT reclaimable
+    await bus.joinMember(root2, "team3", { id: "live", name: "Ann", role: "implementer" });
+    const blocked = await bus.joinMember(root2, "team3", { id: "intruder", name: "Ann", role: "implementer" });
+    ok("live member name still protected", !blocked.ok);
+    // stale heartbeat (crash/power loss, no offline mark) frees the name
+    const members = await bus.loadMembers(root2, "team3");
+    members["live"].lastSeen = Date.now() - (bus.STALE_MEMBER_MS + 1000);
+    await bus.writeJsonAtomic(path.join(bus.teamDir(root2, "team3"), "members.json"), { members });
+    const jr2 = await bus.joinMember(root2, "team3", { id: "revived", name: "Ann", role: "implementer" });
+    ok("stale heartbeat name reclaimed on rejoin", jr2.ok);
+    // preset tracks the intended roster
+    const preset = await bus.loadPreset(root2, "team3");
+    ok("preset exists with members", preset && preset.members.some((m) => m.name === "Zed") && preset.members.some((m) => m.name === "Ann"));
+    await bus.setMemberRole(root2, "team3", "revived", "tech-lead");
+    const preset2 = await bus.loadPreset(root2, "team3");
+    ok("preset role tracks role changes", preset2.members.find((m) => m.name === "Ann").role === "tech-lead");
+    await bus.leaveMember(root2, "team3", "revived");
+    const preset3 = await bus.loadPreset(root2, "team3");
+    ok("preset drops leavers", !preset3.members.some((m) => m.name === "Ann"));
+    fs.rmSync(root2, { recursive: true, force: true });
+  });
+
   await t("concurrent joins do not lose members", async () => {
     const root2 = path.join(root, "concurrent");
     await bus.createTeam(root2, "team2", {});

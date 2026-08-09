@@ -17,9 +17,12 @@ import { randomUUID } from "node:crypto";
 export const TEAMS_ROOT_DEFAULT = path.join(os.homedir(), ".pi", "teams");
 export const TEAM_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export const BOARD_TOPIC_RE = /^[A-Za-z0-9._-]{1,64}$/;
-// A same-name occupant is only auto-replaced when its lastSeen is older than
-// this, i.e. its session is stale/abandoned.
-export const STALE_MEMBER_MS = 10 * 60 * 1000;
+// A same-name occupant is reclaimable when its session is dead: it marked
+// itself offline (graceful shutdown) or its heartbeat has gone stale. Live
+// members touch lastSeen every HEARTBEAT_MS, so a stale lastSeen means the
+// process is gone (crash, power loss) — names of dead sessions are free.
+export const STALE_MEMBER_MS = 5 * 60 * 1000;
+export const HEARTBEAT_MS = 60 * 1000;
 // Locks are held for milliseconds; anything older than this is a dead lock
 // (process killed mid-operation) and safe to reclaim.
 export const STALE_LOCK_MS = 5000;
@@ -191,14 +194,17 @@ export async function joinMember(root, team, { id, name, role, rejoin = false })
     let replaced = false;
     for (const [sid, m] of Object.entries(members)) {
       if (m && m.name === name && sid !== id) {
-        const stale = Date.now() - (m.lastSeen || 0) > STALE_MEMBER_MS;
-        if (!rejoin || !stale) {
+        // A name is only "taken" by a LIVE member (recent heartbeat, not
+        // offline). Dead sessions (crashed / power loss / closed) release
+        // their name so the team can come back without manual cleanup.
+        const dead = m.status === "offline" || Date.now() - (m.lastSeen || 0) > STALE_MEMBER_MS;
+        if (!dead) {
           return {
             ok: false,
-            error: `Name "${name}" is taken by another member (${sid.slice(0, 8)}…). Pick a unique name with --name.`,
+            error: `Name "${name}" is held by a LIVE member (${sid.slice(0, 8)}…). If that session is dead, it frees the name automatically once its heartbeat goes stale (~5 min), or a coordinator can run /team prune --hours 0 to reap it now. Otherwise pick a unique name with --name.`,
           };
         }
-        delete members[sid]; // auto-rejoin reclaims our name from a stale session
+        delete members[sid]; // reclaim the name from the dead session
         replaced = true;
       }
     }
@@ -210,15 +216,17 @@ export async function joinMember(root, team, { id, name, role, rejoin = false })
       status: "idle",
     };
     await writeJsonAtomic(path.join(teamDir(root, team), "members.json"), { members });
-    await appendLine(
-      path.join(teamDir(root, team), "log.jsonl"),
-      JSON.stringify({
+    await upsertPresetMember(root, team, name, role);
+    await appendTeamLog(
+      root,
+      team,
+      {
         ts: Date.now(),
         event: replaced ? "member_rejoined" : "member_joined",
         id,
         name,
         role,
-      }),
+      },
     );
     return { ok: true, member: { id, name, role } };
   });
@@ -231,10 +239,8 @@ export async function leaveMember(root, team, id) {
     delete members[id];
     await writeJsonAtomic(path.join(teamDir(root, team), "members.json"), { members });
     if (m) {
-      await appendLine(
-        path.join(teamDir(root, team), "log.jsonl"),
-        JSON.stringify({ ts: Date.now(), event: "member_left", id, name: m.name }),
-      );
+      await removePresetMember(root, team, m.name);
+      await appendTeamLog(root, team, { ts: Date.now(), event: "member_left", id, name: m.name });
     }
     return { ok: true };
   });
@@ -309,10 +315,8 @@ export async function setMemberRole(root, team, id, role) {
     if (!m) return { ok: false, error: "not a member" };
     m.role = sanitizeRole(role);
     await writeJsonAtomic(path.join(teamDir(root, team), "members.json"), { members });
-    await appendLine(
-      path.join(teamDir(root, team), "log.jsonl"),
-      JSON.stringify({ ts: Date.now(), event: "role_changed", id, role: m.role }),
-    );
+    await upsertPresetMember(root, team, m.name, m.role);
+    await appendTeamLog(root, team, { ts: Date.now(), event: "role_changed", id, role: m.role });
     return { ok: true, member: m };
   });
 }
@@ -962,4 +966,52 @@ export async function sweepTeam(root, team) {
   }
   await pruneMembers(root, team, { olderThanMs: AUTO_PRUNE_OLDER_MS }).catch(() => {});
   await rotateLogIfNeeded(root, team).catch(() => {});
+}
+
+// ---------------------------------------------------------------------------
+// Team preset: the intended roster (name + role), independent of liveness.
+// Auto-updated on join/leave/role-change; survives crashes (it is on disk);
+// used by `team revive` / `/team revive` to spawn the whole team back.
+// ---------------------------------------------------------------------------
+
+export async function loadPreset(root, team) {
+  const data = await readJson(path.join(teamDir(root, team), "preset.json"), null);
+  return data && Array.isArray(data.members) ? data : null;
+}
+
+export async function savePreset(root, team, members) {
+  const file = path.join(teamDir(root, team), "preset.json");
+  await writeJsonAtomic(file, {
+    name: team,
+    savedAt: Date.now(),
+    members: members.map((m) => ({ name: m.name, role: m.role || "agent" })),
+  });
+  return { ok: true };
+}
+
+export async function upsertPresetMember(root, team, name, role) {
+  const preset = (await loadPreset(root, team)) || { name: team, savedAt: Date.now(), members: [] };
+  const entry = { name, role: sanitizeRole(role) };
+  const idx = preset.members.findIndex((m) => m.name === name);
+  if (idx >= 0) preset.members[idx] = entry;
+  else preset.members.push(entry);
+  preset.savedAt = Date.now();
+  await writeJsonAtomic(path.join(teamDir(root, team), "preset.json"), preset);
+}
+
+export async function removePresetMember(root, team, name) {
+  const preset = await loadPreset(root, team);
+  if (!preset) return;
+  preset.members = preset.members.filter((m) => m.name !== name);
+  preset.savedAt = Date.now();
+  await writeJsonAtomic(path.join(teamDir(root, team), "preset.json"), preset);
+}
+
+// Refresh the preset from the current live roster (explicit /team preset save).
+export async function refreshPresetFromRoster(root, team) {
+  const members = await loadMembers(root, team);
+  const rows = Object.values(members)
+    .filter((m) => m && m.name)
+    .map((m) => ({ name: m.name, role: m.role || "agent" }));
+  return savePreset(root, team, rows);
 }
