@@ -164,6 +164,8 @@ export default function (pi: ExtensionAPI) {
     const roster = bus.rosterList(members, me.id);
     const coordinators = roster.filter((m) => bus.hasRole(m.role, "coordinator")).map((m) => m.name);
     const reviewers = roster.filter((m) => bus.hasRole(m.role, "reviewer")).map((m) => m.name);
+    const researchers = roster.filter((m) => bus.hasRole(m.role, "researcher")).map((m) => m.name);
+    const amResearcher = bus.hasRole(me.role, "researcher");
     const lines = [`You are ${me.name} (${me.role}) in team "${me.team}".`];
     if (brief?.trim()) {
       lines.push(`Mission: ${brief.trim()}`);
@@ -182,6 +184,31 @@ export default function (pi: ExtensionAPI) {
       );
     } else {
       lines.push("No reviewers on this team — the coordinator reviews completed work.");
+    }
+    // Team protocol (role-aware, derived from the roster).
+    lines.push("Protocol:");
+    if (amResearcher) {
+      lines.push(
+        `- Your duty: when any member DMs you a research request, investigate thoroughly, send the FULL report back to the requester, and send a one-line tldr to role:coordinator${coordinators.length ? ` (${coordinators.join(", ")})` : ""}. Explicitly flag anything you could not verify.`,
+      );
+      lines.push("- If your work crosses another member's path, DM them directly to coordinate.");
+      lines.push("- If you feel uncertain about anything, say so explicitly in your report and note what you could not verify.");
+    } else {
+      lines.push(
+        "- If your work crosses another member's files/scope, DM them directly to coordinate and resolve conflicts — don't route everything through the coordinator.",
+      );
+      if (researchers.length) {
+        lines.push(
+          `- Research: whenever you need something searched, investigated, or fact-checked, DM role:researcher (${researchers.join(", ")}) with the question. They send the full report back to you and a tldr to the coordinator.`,
+        );
+        lines.push(
+          "- Confidence: if you feel uncertain about a design, a dependency, or any fact, immediately ask the researcher to investigate before proceeding — do not guess.",
+        );
+      } else {
+        lines.push(
+          "- Research/confidence: no researcher on this team — if you feel uncertain or need investigation, say so explicitly in your report, note what you could not verify, and let the coordinator decide next steps.",
+        );
+      }
     }
     return lines.join("\n");
   }
@@ -792,7 +819,9 @@ export default function (pi: ExtensionAPI) {
       "Use team task_done with task_id and evidence (what changed, file refs, validation) to complete a board task — evidence is required and unfinished dependencies block completion unless you pass dep_override with a reason.",
       "Use team report to send your completion report to role:coordinator after finishing assigned work.",
       "Use team roster to see teammates and roles; use team inbox to check for new messages mid-turn.",
-      "Every turn starts with a [team-context] briefing: your role, the mission, who to report to (role:coordinator), and where completed work goes (role:reviewer). Follow it.",
+      "Every turn starts with a [team-context] briefing: your role, the mission, who to report to (role:coordinator), where completed work goes (role:reviewer), and the team protocol. Follow it.",
+      "If your work crosses another member's scope, DM them directly to coordinate.",
+      "If you need research or feel uncertain about anything, DM role:researcher to investigate before proceeding.",
       "Use team board_write/board_read for shared design notes instead of long DMs.",
     ],
     parameters: Type.Object({

@@ -64,17 +64,46 @@ injected at the start of his next turn, does the work, and sends
   (soft interrupt, like jcode).
 - Agents can also check anytime with `team inbox` (via the `team` tool).
 
-Example briefing a worker sees:
+The briefing is **role-aware**: workers see the research/confidence protocol,
+and a member with the `researcher` role sees their *duty* instead.
+
+Example worker briefing (team with a researcher):
 
 ```
 [team-context] You are Bee (implementer) in team "invader".
-Mission: Ship the login flow; tests must pass.
-Team: Bee(implementer), Optimus(coordinator, reviewer)
+Mission: Build the parser; verify library compatibility first.
+Team: Bee(implementer), Ghost(researcher), Optimus(coordinator, reviewer)
 Report to: role:coordinator (Optimus) — use team report for completion reports;
   task_blocked/task_fail auto-notify them.
 Pass completed work to: role:reviewer (Optimus) — created review tasks land
   there and bounce failed work back to you.
+Protocol:
+- If your work crosses another member's files/scope, DM them directly to
+  coordinate and resolve conflicts — don't route everything through the
+  coordinator.
+- Research: whenever you need something searched, investigated, or fact-checked,
+  DM role:researcher (Ghost) with the question. They send the full report back
+  to you and a tldr to the coordinator.
+- Confidence: if you feel uncertain about a design, a dependency, or any fact,
+  immediately ask the researcher to investigate before proceeding — do not guess.
 ```
+
+The researcher's own briefing swaps the protocol for their duty:
+
+```
+Protocol:
+- Your duty: when any member DMs you a research request, investigate thoroughly,
+  send the FULL report back to the requester, and send a one-line tldr to
+  role:coordinator (Optimus). Explicitly flag anything you could not verify.
+- If your work crosses another member's path, DM them directly to coordinate.
+- If you feel uncertain about anything, say so explicitly in your report and
+  note what you could not verify.
+```
+
+If the team has **no researcher**, the protocol falls back to "say so explicitly
+in your report and let the coordinator decide next steps" — no dangling
+instructions. The coordinator can extend the mission text (`team briefing
+--body`) with any additional standing orders.
 
 ## The `team` tool (what agents call)
 
