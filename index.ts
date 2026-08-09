@@ -578,7 +578,10 @@ export default function (pi: ExtensionAPI) {
     for (const m of preset.members) {
       if (m.name === me.name) continue;
       const live = Object.values(members).some(
-        (x: any) => x.name === m.name && x.status !== "offline" && now - (x.lastSeen || 0) < bus.STALE_MEMBER_MS,
+        (x: any) =>
+          x.name === m.name &&
+          x.status !== "offline" &&
+          now - (x.lastSeen || 0) < 90_000, // heartbeat is 60s: >90s = dead, respawn
       );
       if (live) {
         skipped.push(m.name);
@@ -1832,11 +1835,20 @@ export default function (pi: ExtensionAPI) {
       "wezterm",
       "xterm",
     ];
+    const manualCmd = `cd ${shq(cwd)}\n  ${envPart} pi`;
     for (const t of launchers) {
       try {
         const child = spawn(t, ["-e", "bash", "-lc", inner], { detached: true, stdio: "ignore" });
         child.unref();
-        return `Spawned "${who}" (${role}) in a new ${t} window. It auto-joins team "${me.team}" on start.`;
+        child.on("error", () => { /* launcher missing/failed: try the next one */ });
+        child.on("exit", (code) => {
+          if (code !== 0) {
+            // window failed to open or closed immediately; leave a trace
+            bus.appendTeamLog(me.root, me.team, { ts: Date.now(), event: "spawn_exit", name, role, code }).catch(() => {});
+          }
+        });
+        await bus.appendTeamLog(me.root, me.team, { ts: Date.now(), event: "spawn_attempt", name, role, launcher: t }).catch(() => {});
+        return `Spawned "${who}" (${role}) in a new ${t} window. It auto-joins team "${me.team}" on start. If no window appears, run it manually:\n  ${manualCmd}`;
       } catch {
         /* try next launcher */
       }
