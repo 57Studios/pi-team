@@ -304,10 +304,10 @@ export default function (pi: ExtensionAPI) {
       if (!c) return;
       const content = `[scheduled ping] ${t.body || "(no note)"}`;
       if (c.hasUI) c.ui.notify(`[team:${me.team}] ⏰ timer fired: ${t.body || "ping"}`, "info");
-      pi.sendMessage(
-        { customType: "team-briefing", content, display: true },
-        { triggerTurn: true, deliverAs: "followUp" },
-      );
+      // Deliver as a REAL user message: it always renders with the content and
+      // always triggers a turn. The custom-message renderer path proved fragile
+      // (pi could echo it with empty content -> the empty "[team]" box).
+      pi.sendUserMessage(content, { deliverAs: "followUp" });
     };
     // After a fire, standing cadence continues: re-create the next timer AND
     // schedule its timeout (armTimers claims-due + schedules all pending).
@@ -421,8 +421,11 @@ export default function (pi: ExtensionAPI) {
           const autoRespond = meta?.autoRespond !== false;
           const interject = meta?.interject !== false;
           const emitBriefing = (content: string, opts: Record<string, any>) => {
-            if (!content.trim()) return; // never send an empty team-briefing
-            pi.sendMessage({ customType: "team-briefing", content, display: true }, opts);
+            if (!content.trim()) return; // never deliver an empty message
+            // Real user message: always visible with content, always triggers a
+            // turn (idle) or steers (busy). No custom-message renderer, so no
+            // empty "[team]" box is possible.
+            pi.sendUserMessage(content, opts);
           };
           if (!c.isIdle() && interject) {
             // Busy: steer the messages in before the next LLM call (soft interrupt).
@@ -441,7 +444,7 @@ export default function (pi: ExtensionAPI) {
               if (msgs.length) {
                 const senders = msgs.map((m: any) => m.fromName).filter(Boolean);
                 const rec = await bus.recordCheckinReplies(me.root, me.team, me.id, senders);
-                emitBriefing(formatMessages(msgs) + checkinProgressLine(rec), { triggerTurn: true, deliverAs: "followUp" });
+                emitBriefing(formatMessages(msgs) + checkinProgressLine(rec), { deliverAs: "followUp" });
               }
             } else {
               scheduleRetry(); // rate-limited: pick it up on the next window
@@ -694,7 +697,10 @@ export default function (pi: ExtensionAPI) {
       message: {
         customType: "team-briefing",
         content,
-        display: true,
+        // The briefing is MODEL CONTEXT, not UI: display:false keeps it out of
+        // the chat (no box to render) while it still reaches the model via
+        // before_agent_start. This eliminates the last team-briefing box path.
+        display: false,
       },
     };
   });
