@@ -102,8 +102,11 @@ with other harnesses' root-level `MEMORY.md` / `AGENTS.md` conventions:
 - **`/team config --auto-respond on|off`** (coordinator) → idle members
   auto-start a turn whenever a DM arrives (rate-limited). Default off to avoid
   surprise turns and ping-pong loops.
-- **New DM at the start of a turn** → auto-injected into context as a
+- **New DM to an idle member** → auto-read: the member auto-starts a turn
+  (rate-limited ~3/min) and the message is injected as a
   `[team inbox — N new messages]` block (`[wake]` marked when applicable).
+  `autoRespond` defaults ON — no "prompt your agent to read them" step.
+  Coordinators can disable it with `/team config --auto_respond false`.
 - **New DM while mid-turn** → injected before the agent's next LLM call
   (soft interrupt, like jcode).
 - Agents can also check anytime with `team inbox` (via the `team` tool).

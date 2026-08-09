@@ -212,7 +212,7 @@ export default function (pi: ExtensionAPI) {
         "- If your work crosses another member's files/scope, DM them directly to coordinate and resolve conflicts — don't route everything through the coordinator.",
       );
       lines.push(
-        "- To get an immediate answer from an idle member, mark the message wake: team dm --wake — idle members auto-start a turn for wake messages (rate-limited).",
+        "- Idle members auto-start a turn when you DM/broadcast them (rate-limited ~3/min) — messages are read automatically, no one needs to prompt them. For an urgent immediate turn, mark the message wake: team dm --wake.",
         "- Status checks are NON-BLOCKING: use team checkin (wake-DMs everyone, then END YOUR TURN). Replies auto-wake you one at a time with progress; never sleep or poll the inbox waiting for replies.",
       );
       if (researchers.length) {
@@ -309,7 +309,17 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     let timer: NodeJS.Timeout | undefined;
+    let retryTimer: NodeJS.Timeout | undefined;
     let busy = false;
+    // Re-check shortly when the auto-turn budget is exhausted so unread
+    // messages are picked up without the user having to prompt the agent.
+    const scheduleRetry = () => {
+      if (retryTimer) return;
+      retryTimer = setTimeout(() => {
+        retryTimer = undefined;
+        watcherCheck();
+      }, 25_000);
+    };
     // Heartbeat while in a team: lastSeen is a real liveness signal, so a
     // crashed/power-loss session releases its name once the heartbeat goes
     // stale (STALE_MEMBER_MS) and the team can be revived cleanly.
@@ -317,21 +327,22 @@ export default function (pi: ExtensionAPI) {
     heartbeat = setInterval(() => {
       bus.touchMember(me.root, me.team, me.id).catch(() => {});
     }, bus.HEARTBEAT_MS);
-    watcher = fs.watch(dir, () => {
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(async () => {
-        if (busy) return;
-        busy = true;
-        try {
+    const watcherCheck = async () => {
+      if (busy) return;
+      busy = true;
+      try {
           const c = ctx;
           if (!c) return;
           const pending = await bus.pendingCount(me.root, me.team, me.id);
           if (!pending) return;
           const hasWake = await bus.hasWakePending(me.root, me.team, me.id);
           const meta = await bus.loadTeam(me.root, me.team);
-          const autoRespond = meta?.autoRespond === true;
+          // autoRespond defaults ON: an idle member auto-starts a turn for any
+          // new message (rate-limited), so nothing waits on a manual prompt.
+          const autoRespond = meta?.autoRespond !== false;
           const interject = meta?.interject !== false;
           if (!c.isIdle() && interject) {
+            // Busy: steer the messages in before the next LLM call (soft interrupt).
             const msgs = await bus.drainInbox(me.root, me.team, me.id);
             if (msgs.length) {
               const senders = msgs.map((m: any) => m.fromName).filter(Boolean);
@@ -341,17 +352,23 @@ export default function (pi: ExtensionAPI) {
                 { deliverAs: "steer" },
               );
             }
-          } else if (c.isIdle() && (autoRespond || hasWake) && allowAutoTurn()) {
-            const msgs = await bus.drainInbox(me.root, me.team, me.id);
-            if (msgs.length) {
-              const senders = msgs.map((m: any) => m.fromName).filter(Boolean);
-              const rec = await bus.recordCheckinReplies(me.root, me.team, me.id, senders);
-              pi.sendMessage(
-                { customType: "team-briefing", content: formatMessages(msgs) + checkinProgressLine(rec), display: true },
-                { triggerTurn: true, deliverAs: "followUp" },
-              );
+          } else if (c.isIdle() && (autoRespond || hasWake)) {
+            if (allowAutoTurn()) {
+              const msgs = await bus.drainInbox(me.root, me.team, me.id);
+              if (msgs.length) {
+                const senders = msgs.map((m: any) => m.fromName).filter(Boolean);
+                const rec = await bus.recordCheckinReplies(me.root, me.team, me.id, senders);
+                pi.sendMessage(
+                  { customType: "team-briefing", content: formatMessages(msgs) + checkinProgressLine(rec), display: true },
+                  { triggerTurn: true, deliverAs: "followUp" },
+                );
+              }
+            } else {
+              scheduleRetry(); // rate-limited: pick it up on the next window
             }
           } else {
+            // autoRespond explicitly OFF (or busy with interject off): the
+            // member opted out of auto-turns, so surface it in the UI.
             if (c.hasUI) {
               c.ui.notify(`[team:${me.team}] ${pending} new message(s) for you. Prompt your agent to read them.`, "info");
             }
@@ -362,7 +379,10 @@ export default function (pi: ExtensionAPI) {
         } finally {
           busy = false;
         }
-      }, 250);
+      };
+    watcher = fs.watch(dir, () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(watcherCheck, 250);
     });
   }
 
@@ -1038,7 +1058,7 @@ export default function (pi: ExtensionAPI) {
             return "error: only a coordinator can change team settings.";
           }
           const res = await bus.setTeamSetting(root, me.team, { autoRespond: p.auto_respond === true });
-          return `autoRespond is now ${res.team.autoRespond ? "ON" : "OFF"}. When ON, idle members auto-start a turn on DMs (rate-limited); messages marked wake (dm --wake) always wake them.`;
+          return `autoRespond is now ${res.team.autoRespond ? "ON" : "OFF"} (default ON). When ON, idle members auto-start a turn for any new message (rate-limited ~3/min); set false if you want to read messages only on your own prompt.`;
         }
         const meta = await bus.loadTeam(root, me.team);
         return `Team "${me.team}" — autoRespond: ${meta?.autoRespond} | interject: ${meta?.interject}. Set with team config --auto_respond true|false.`;

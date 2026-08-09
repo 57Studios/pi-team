@@ -449,6 +449,18 @@ const main = async () => {
     fs.rmSync(root2, { recursive: true, force: true });
   });
 
+  await t("autoRespond defaults ON (no manual prompt needed)", async () => {
+    const root2 = path.join(root, "ar");
+    await bus.createTeam(root2, "a", {});
+    const meta = await bus.loadTeam(root2, "a");
+    ok("autoRespond defaults true", meta.autoRespond === true);
+    await bus.setTeamSetting(root2, "a", { autoRespond: false });
+    ok("explicitly disableable", (await bus.loadTeam(root2, "a")).autoRespond === false);
+    await bus.setTeamSetting(root2, "a", { autoRespond: true });
+    ok("re-enableable", (await bus.loadTeam(root2, "a")).autoRespond === true);
+    fs.rmSync(root2, { recursive: true, force: true });
+  });
+
   await t("project memory (MEMORY.md)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memo-"));
     // first append seeds the header

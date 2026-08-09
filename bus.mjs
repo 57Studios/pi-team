@@ -177,8 +177,10 @@ export async function createTeam(root, team, opts = {}) {
     created: Date.now(),
     createdBy: opts.name || null,
     // autoRespond: when true, an idle member auto-starts a turn when a DM
-    // arrives (max 3 auto-turns/min). Default off to avoid surprise work.
-    autoRespond: Boolean(opts.autoRespond),
+    // arrives (max 3 auto-turns/min). Default ON so incoming messages are
+    // read automatically (no "prompt your agent" step); coordinators can
+    // turn it off with team config --auto_respond false.
+    autoRespond: opts.autoRespond !== false,
     // interject: when true, a busy member sees incoming DMs before its next
     // LLM call (soft interrupt, like jcode). Default on.
     interject: opts.interject !== false,
