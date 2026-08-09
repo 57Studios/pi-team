@@ -701,10 +701,11 @@ export default function (pi: ExtensionAPI) {
       message: {
         customType: "team-briefing",
         content,
-        // The briefing is MODEL CONTEXT, not UI: display:false keeps it out of
-        // the chat (no box to render) while it still reaches the model via
-        // before_agent_start. This eliminates the last team-briefing box path.
-        display: false,
+        // Visible confirmation that the briefing was injected (the empty-box
+        // bug was fixed at the source: watcher/timers deliver via real user
+        // messages, the renderer never draws an empty box, and this content
+        // is never empty).
+        display: true,
       },
     };
   });
