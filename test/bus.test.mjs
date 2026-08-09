@@ -277,6 +277,30 @@ const main = async () => {
     fs.rmSync(root2, { recursive: true, force: true });
   });
 
+  await t("project memory (MEMORY.md)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memo-"));
+    // first append seeds the header
+    const a = await bus.memoAppend(dir, { team: "Alpha", name: "Bee", role: "implementer", body: "Chose postgres over mysql." });
+    ok("memo create", a.ok && a.file.endsWith("MEMORY.md"));
+    let txt = await bus.memoRead(dir);
+    ok("header seeded", txt.includes("# Project Memory — team Alpha"));
+    ok("entry tagged with author+role", txt.includes("Bee (implementer)"));
+    ok("body recorded", txt.includes("postgres"));
+    // second append adds another entry without duplicating the header
+    await bus.memoAppend(dir, { team: "Alpha", name: "Ghost", role: "researcher", body: "Vendor lib X is unmaintained." });
+    txt = await bus.memoRead(dir);
+    ok("header not duplicated", txt.split("# Project Memory").length === 2);
+    ok("second entry present", txt.includes("Ghost (researcher)") && txt.includes("unmaintained"));
+    // concurrent appends don't lose entries
+    await Promise.all(
+      Array.from({ length: 6 }, (_, i) => bus.memoAppend(dir, { team: "Alpha", name: `A${i}`, role: "worker", body: `note ${i}` })),
+    );
+    txt = await bus.memoRead(dir);
+    ok("all concurrent notes survived", [0,1,2,3,4,5].every((i) => txt.includes(`note ${i}`)));
+    ok("no lock left behind", !fs.existsSync(path.join(dir, ".lock")));
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   await t("concurrent joins do not lose members", async () => {
     const root2 = path.join(root, "concurrent");
     await bus.createTeam(root2, "team2", {});

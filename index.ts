@@ -35,7 +35,7 @@ const ACTIONS = [
   "inbox", "board_write", "board_read", "status", "whoami", "set_role",
   "spawn", "selftest",
   "task_create", "task_list", "task_show", "task_start", "task_done", "task_blocked", "task_fail", "task_assign",
-  "preset_show", "preset_save", "preset_create", "revive", "briefing",
+  "preset_show", "preset_save", "preset_create", "revive", "briefing", "memo",
 ] as const;
 
 const TEAM_IDENTITY_ENTRY = "team-identity";
@@ -195,6 +195,9 @@ export default function (pi: ExtensionAPI) {
     } else {
       lines.push("No reviewers on this team — the coordinator reviews completed work.");
     }
+    lines.push(
+      "Project memory: read MEMORY.md in the working directory when you start work; record decisions, gotchas, and next steps with team memo.",
+    );
     // Team protocol (role-aware, derived from the roster).
     lines.push("Protocol:");
     if (amResearcher) {
@@ -366,6 +369,22 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  // Seed MEMORY.md in the working directory on first use (no-op if present).
+  async function seedMemo(c: ExtensionContext, me: NonNullable<Awaited<ReturnType<typeof myTeam>>>) {
+    try {
+      if (!(await bus.memoRead(c.cwd))) {
+        await bus.memoAppend(c.cwd, {
+          team: me.team,
+          name: me.name,
+          role: me.role,
+          body: `Team "${me.team}" is working in this directory (${me.role}). Record decisions, file maps, gotchas, and next steps here with team memo.`,
+        });
+      }
+    } catch {
+      /* best-effort */
+    }
+  }
+
   let lastWidgetAt = 0;
   async function refreshWidget(c: ExtensionContext | undefined, me: NonNullable<Awaited<ReturnType<typeof myTeam>>>, force = false) {
     if (!c?.hasUI) return;
@@ -412,6 +431,7 @@ export default function (pi: ExtensionAPI) {
     if (me) {
       startWatcher(me);
       applyTitle(c, me);
+      await seedMemo(c, me);
       await maybeSweep(me);
       await refreshWidget(c, me, true);
       if (c.hasUI) {
@@ -773,6 +793,14 @@ export default function (pi: ExtensionAPI) {
         return `Preset for "${me.team}" set (${roster.length} member(s)). Revive it with team revive.`;
       }
 
+      case "memo": {
+        if (!me) return notInTeam;
+        const body = String(p.body || "").trim();
+        if (!body) return "error: body required (what to remember).";
+        const res = await bus.memoAppend(c.cwd, { team: me.team, name: me.name, role: me.role, body });
+        return res.ok ? `Recorded in ${res.file}.` : `error: ${res.error || "could not write"}`;
+      }
+
       case "briefing": {
         if (!me) return notInTeam;
         if (p.body !== undefined && String(p.body).trim()) {
@@ -845,7 +873,7 @@ export default function (pi: ExtensionAPI) {
     name: "team",
     label: "Team",
     description:
-      "Coordinate with other pi agents in your team (like a company): join teams, DM teammates, assign tasks, post reports, share a board, and track a structured task board. Actions: create, join, leave, roster, dm, broadcast, task, report, inbox, board_write, board_read, status, whoami, set_role, spawn, selftest, task_create, task_list, task_show, task_start, task_done, task_blocked, task_fail, task_assign, preset_show, preset_save, preset_create, revive, briefing (read, or set the team mission as coordinator). Address recipients by member name or role:<role> (e.g. role:implementer). Reports go to role:coordinator by default. Tasks live on the team board; completing one REQUIRES evidence, is blocked on unfinished dependencies unless dep_override, and kind=review tasks gate a reviewed task (failure bounces it back to running).",
+      "Coordinate with other pi agents in your team (like a company): join teams, DM teammates, assign tasks, post reports, share a board, and track a structured task board. Actions: create, join, leave, roster, dm, broadcast, task, report, inbox, board_write, board_read, status, whoami, set_role, spawn, selftest, task_create, task_list, task_show, task_start, task_done, task_blocked, task_fail, task_assign, preset_show, preset_save, preset_create, revive, briefing (read, or set the team mission as coordinator), memo (append to MEMORY.md project memory in the working directory). Address recipients by member name or role:<role> (e.g. role:implementer). Reports go to role:coordinator by default. Tasks live on the team board; completing one REQUIRES evidence, is blocked on unfinished dependencies unless dep_override, and kind=review tasks gate a reviewed task (failure bounces it back to running).",
     promptSnippet: "Coordinate with teammate pi agents via team: DM, assign tasks, post reports, share a board, track tasks",
     promptGuidelines: [
       "Use team when the user wants multiple agents to work together or you need help from a teammate.",
@@ -1010,6 +1038,14 @@ export default function (pi: ExtensionAPI) {
             const res = await bus.pruneMembers(root, me.team, { olderThanMs });
             return notify(`Pruned ${res.removed} member(s) last seen more than ${hours > 0 ? hours + "h" : "3 min (dead)"} ago.`);
           }
+          case "memo": {
+            const me = await myTeam(c);
+            if (!me) return notify("You are not in a team.");
+            const body = argv._.slice(1).join(" ") || argv.body;
+            if (!body) return notify("Usage: /team memo <what to remember>");
+            const res = await bus.memoAppend(c.cwd, { team: me.team, name: me.name, role: me.role, body });
+            return notify(`Recorded in ${res.file}.`);
+          }
           case "briefing": {
             const me = await myTeam(c);
             if (!me) return notify("You are not in a team.");
@@ -1123,6 +1159,7 @@ export default function (pi: ExtensionAPI) {
               "/team inbox                                   read pending messages",
               "/team set-role <role> / set-name <name>       update your role/name",
               "/team prune [--hours N]                       remove dead members (0 = dead only, default 24h)",
+              "/team memo <text>                            append to MEMORY.md in this directory (project memory)",
               "/team briefing [--body \"...\"]               read / set the team mission (coordinator can set)",
               "/team preset [save]                           show/refresh the saved team (name + role)",
               "/team preset create N=role [N=role ...]        seed the preset from scratch (multi roles ok)",

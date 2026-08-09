@@ -89,8 +89,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Mutex via a lock directory. All writers to members.json / team.json go
 // through here so concurrent pi instances never lose each other's updates.
-export async function withTeamLock(root, team, fn, timeoutMs = 4000) {
-  const lock = path.join(teamDir(root, team), ".lock");
+export async function withDirLock(dir, fn, timeoutMs = 4000) {
+  const lock = path.join(dir, ".lock");
   const start = Date.now();
   for (;;) {
     try {
@@ -98,7 +98,7 @@ export async function withTeamLock(root, team, fn, timeoutMs = 4000) {
       break;
     } catch {
       if (Date.now() - start > timeoutMs) {
-        throw new Error(`team lock timed out (${team})`);
+        throw new Error(`lock timed out (${path.basename(dir)})`);
       }
       try {
         const st = await fsp.stat(lock);
@@ -116,6 +116,10 @@ export async function withTeamLock(root, team, fn, timeoutMs = 4000) {
   } finally {
     await fsp.rm(lock, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+export function withTeamLock(root, team, fn, timeoutMs = 4000) {
+  return withDirLock(teamDir(root, team), fn, timeoutMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -1194,4 +1198,57 @@ export async function saveBrief(root, team, text) {
   await writeTextAtomic(path.join(teamDir(root, team), "brief.md"), text);
   await appendTeamLog(root, team, { ts: Date.now(), event: "brief_updated" });
   return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
+// Project memory: MEMORY.md in the working directory, shared by all team
+// members (they share the repo). Appended via team memo / /team memo; seeded
+// with a header on first use. Concurrent appends are serialized with a lock.
+// ---------------------------------------------------------------------------
+
+export function memoFile(cwd) {
+  return path.join(cwd || ".", "MEMORY.md");
+}
+
+export async function memoRead(cwd) {
+  try {
+    return await fsp.readFile(memoFile(cwd), "utf8");
+  } catch {
+    return null;
+  }
+}
+
+export async function memoAppend(cwd, { team, name, role, body }) {
+  const file = memoFile(cwd);
+  const dir = path.dirname(file);
+  return withDirLock(dir, async () => {
+    await fsp.mkdir(dir, { recursive: true });
+    let existing = "";
+    try {
+      existing = await fsp.readFile(file, "utf8");
+    } catch {
+      /* new file */
+    }
+    const lines = [];
+    if (!existing.trim()) {
+      lines.push(`# Project Memory — team ${team}`);
+      lines.push("");
+      lines.push(
+        "Shared working memory for the team. Append dated entries with `team memo`;",
+      );
+      lines.push("new members read this file first. Add decisions, file maps, gotchas, and next steps.");
+      lines.push("");
+      lines.push("---");
+      lines.push("");
+    }
+    const when = new Date().toISOString().slice(0, 16).replace("T", " ");
+    lines.push(`## ${when} · ${name} (${role})`);
+    lines.push("");
+    lines.push(String(body || "").trim());
+    lines.push("");
+    lines.push("---");
+    lines.push("");
+    await writeTextAtomic(file, existing + lines.join("\n"));
+    return { ok: true, file };
+  });
 }
