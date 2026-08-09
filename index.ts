@@ -279,6 +279,15 @@ export default function (pi: ExtensionAPI) {
   // footer widget + hygiene sweep
   // -------------------------------------------------------------------------
 
+  // Set the terminal window/tab title so each agent's window shows who it is.
+  function applyTitle(c: ExtensionContext | undefined, me: NonNullable<Awaited<ReturnType<typeof myTeam>>>) {
+    try {
+      c?.ui.setTitle(`${me.team} / ${me.name} (${me.role})`);
+    } catch {
+      /* best-effort */
+    }
+  }
+
   let lastWidgetAt = 0;
   async function refreshWidget(c: ExtensionContext | undefined, me: NonNullable<Awaited<ReturnType<typeof myTeam>>>, force = false) {
     if (!c?.hasUI) return;
@@ -318,6 +327,7 @@ export default function (pi: ExtensionAPI) {
     const me = await myTeam(c);
     if (me) {
       startWatcher(me);
+      applyTitle(c, me);
       await maybeSweep(me);
       await refreshWidget(c, me, true);
       if (c.hasUI) {
@@ -452,7 +462,10 @@ export default function (pi: ExtensionAPI) {
           saveSessionIdentity(c, { root, team, name: jr.member.name, role: jr.member.role });
           memberId = id;
           const me2 = await myTeam(c);
-          if (me2) startWatcher(me2);
+          if (me2) {
+            startWatcher(me2);
+            applyTitle(c, me2);
+          }
           return `Team "${team}" ready at ${bus.teamDir(root, team)}. You joined as ${jr.member.name} (${jr.member.role}).\nTeammates join with: team join ${team} --role <their-role> --name <their-name>`;
         }
         return `Team "${team}" created at ${bus.teamDir(root, team)}. Join it with: team join ${team} --name <you> --role <role>`;
@@ -466,7 +479,10 @@ export default function (pi: ExtensionAPI) {
         saveSessionIdentity(c, { root, team, name: jr.member.name, role: jr.member.role });
         memberId = id;
         const me2 = await myTeam(c);
-        if (me2) startWatcher(me2);
+        if (me2) {
+          startWatcher(me2);
+          applyTitle(c, me2);
+        }
         const members = await bus.loadMembers(root, team);
         return `Joined team "${team}" as ${jr.member.name} (${jr.member.role}).\n${rosterLine(team, bus.rosterList(members, id))}`;
       }
@@ -475,6 +491,9 @@ export default function (pi: ExtensionAPI) {
         if (!me) return notInTeam;
         await bus.leaveMember(root, me.team, me.id);
         stopWatcher();
+        try {
+          c.ui.setTitle("pi");
+        } catch { /* ignore */ }
         return `Left team "${me.team}".`;
       }
 
@@ -814,7 +833,10 @@ export default function (pi: ExtensionAPI) {
               saveSessionIdentity(c, { root, team, name: jr.member.name, role: jr.member.role });
               memberId = id;
               const me = await myTeam(c);
-              if (me) startWatcher(me);
+              if (me) {
+                startWatcher(me);
+                applyTitle(c, me);
+              }
               return notify(`Team "${team}" created. You joined as ${jr.member.name} (${jr.member.role}).`);
             }
             return notify(`Team "${team}" created at ${bus.teamDir(root, team)}.`);
@@ -827,7 +849,10 @@ export default function (pi: ExtensionAPI) {
             saveSessionIdentity(c, { root, team, name: jr.member.name, role: jr.member.role });
             memberId = id;
             const me = await myTeam(c);
-            if (me) startWatcher(me);
+            if (me) {
+              startWatcher(me);
+              applyTitle(c, me);
+            }
             return notify(`Joined "${team}" as ${jr.member.name} (${jr.member.role}).`);
           }
           case "leave": {
@@ -1033,14 +1058,19 @@ export default function (pi: ExtensionAPI) {
     const prompt = String(p.prompt || "").trim();
     const cwd = c.cwd || process.cwd();
     const envPart = `PI_TEAM=${shq(me.team)} PI_TEAM_ROLE=${shq(role)} PI_TEAM_NAME=${shq(name)} PI_TEAM_DIR=${shq(me.root)}`;
-    const inner = `cd ${shq(cwd)} && ${envPart} exec pi${prompt ? ` -p ${shq(prompt)}` : ""}`;
     const who = name || role;
+    // Title the terminal window before pi even boots (OSC 0 window-title
+    // escape). pi re-applies the same title via ctx.ui.setTitle on session
+    // start, so this only covers the pre-boot window.
+    const title = `${me.team} / ${who} (${role})`;
+    const titleCmd = `title=${shq(title)}; printf '\\033]0;%s\\007' "$title"; `;
+    const inner = `${titleCmd}cd ${shq(cwd)} && ${envPart} exec pi${prompt ? ` -p ${shq(prompt)}` : ""}`;
 
     if (process.platform === "darwin") {
       try {
         spawn(
           "osascript",
-          ["-e", `tell application "Terminal" to do script "cd ${shq(cwd)} && ${envPart} pi"`],
+          ["-e", `tell application "Terminal" to do script "${titleCmd}cd ${shq(cwd)} && ${envPart} pi"`],
           { detached: true, stdio: "ignore" },
         ).unref();
         return `Spawned "${who}" (${role}) in a new Terminal window. It auto-joins team "${me.team}" on start.`;

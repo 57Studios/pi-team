@@ -185,9 +185,14 @@ automatically; `/team prune [--hours N]` sweeps sooner (default 24h,
 
 ## UI
 
-A footer status shows `[team:name] N members · M msg · X/Y tasks done`,
-updated on join/leave, new mail, and task transitions (refreshed at most
-once per 15s). Teammates see you as `offline` after you close pi.
+- **Terminal title** — each agent's window/tab is titled
+  `team / name (role)`, e.g. `Alpha / Bee (implementer)`, so you can tell
+  who's who at a glance. Set by pi itself on session start (covers resume),
+  and pre-set by the spawn/revive command before pi boots (OSC window-title
+  escape).
+- **Footer status** — `[team:name] N members · M msg · X/Y tasks done`,
+  updated on join/leave, new mail, and task transitions (refreshed at most
+  once per 15s). Teammates see you as `offline` after you close pi.
 
 ## Roles & hierarchy
 
