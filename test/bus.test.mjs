@@ -509,6 +509,19 @@ const main = async () => {
     fs.rmSync(root2, { recursive: true, force: true });
   });
 
+  await t("web search via SearXNG (resolveSearchUrl + error handling)", async () => {
+    // URL resolution chain: team.json -> env -> default
+    ok("default localhost", bus.resolveSearchUrl({}, null) === "http://127.0.0.1:8888");
+    ok("JCODE_SEARXNG_URL honored", bus.resolveSearchUrl({ JCODE_SEARXNG_URL: "http://127.0.0.1:9999/" }, null) === "http://127.0.0.1:9999");
+    ok("PI_TEAM_SEARXNG_URL wins over JCODE", bus.resolveSearchUrl({ PI_TEAM_SEARXNG_URL: "http://a:1", JCODE_SEARXNG_URL: "http://b:2" }, null) === "http://a:1");
+    ok("team.json searchUrl wins", bus.resolveSearchUrl({ SEARXNG_URL: "http://env:1" }, { searchUrl: "http://team:1/" }) === "http://team:1");
+    // error handling: unreachable URL -> clean error, not a throw
+    const r = await bus.searchWeb("test", { env: { PI_TEAM_SEARXNG_URL: "http://127.0.0.1:1" }, timeoutMs: 1500 });
+    ok("unreachable searxng errors cleanly", !r.ok && typeof r.error === "string" && r.error.length > 0);
+    // empty query
+    ok("empty query rejected", !(await bus.searchWeb("  ")).ok);
+  });
+
   await t("project memory (MEMORY.md)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memo-"));
     // first append seeds the header

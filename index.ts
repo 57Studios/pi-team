@@ -35,7 +35,7 @@ const ACTIONS = [
   "inbox", "board_write", "board_read", "status", "whoami", "set_role",
   "spawn", "selftest",
   "task_create", "task_list", "task_show", "task_start", "task_done", "task_blocked", "task_fail", "task_assign",
-  "preset_show", "preset_save", "preset_create", "revive", "briefing", "memo", "config", "await_members", "kick", "checkin", "later", "timers",
+  "preset_show", "preset_save", "preset_create", "revive", "briefing", "memo", "config", "await_members", "kick", "checkin", "later", "timers", "search",
 ] as const;
 
 const TEAM_IDENTITY_ENTRY = "team-identity";
@@ -216,6 +216,7 @@ export default function (pi: ExtensionAPI) {
         "- Idle members auto-start a turn when you DM/broadcast them (rate-limited ~3/min) — messages are read automatically, no one needs to prompt them. For an urgent immediate turn, mark the message wake: team dm --wake.",
         "- Status checks are NON-BLOCKING: use team checkin (wake-DMs everyone, then END YOUR TURN). Replies auto-wake you one at a time with progress; never sleep or poll the inbox waiting for replies.",
         "- To be woken by the harness later (e.g. check back in 30 min), set a timer: team later --minutes 30 --body \"...\" (or --at HH:MM). The harness pings you with a turn when it fires; timers survive restarts.",
+        "- Web search is built in: team search \"query\" (SearXNG on localhost — no API key; use --categories news for news). Scout/research work: search first, then verify the top hits before citing.",
       );
       if (researchers.length) {
         lines.push(
@@ -1128,6 +1129,22 @@ export default function (pi: ExtensionAPI) {
           .join("\n");
       }
 
+      case "search": {
+        if (!me) return notInTeam;
+        const meta = await bus.loadTeam(root, me.team).catch(() => null);
+        const res = await bus.searchWeb(String(p.query || ""), {
+          count: p.count,
+          categories: String(p.categories || "").trim() || undefined,
+          teamMeta: meta,
+        });
+        if (!res.ok) return `error: ${res.error}`;
+        const lines = [`Search results (${res.count}) via ${res.base}:`];
+        for (const r of res.results) {
+          lines.push(`- ${r.title}\n  ${r.url}${r.snippet ? `\n  ${r.snippet}` : ""}`);
+        }
+        return lines.join("\n");
+      }
+
       case "checkin": {
         if (!me) return notInTeam;
         return await checkinMembers(me, { to: String(p.to || ""), body: String(p.body || "") });
@@ -1249,7 +1266,7 @@ export default function (pi: ExtensionAPI) {
     name: "team",
     label: "Team",
     description:
-      "Coordinate with other pi agents in your team (like a company): join teams, DM teammates, assign tasks, post reports, share a board, and track a structured task board. Actions: create, join, leave, roster, dm, broadcast, task, report, inbox, board_write, board_read, status, whoami, set_role, spawn, selftest, task_create, task_list, task_show, task_start, task_done, task_blocked, task_fail, task_assign, preset_show, preset_save, preset_create, revive, briefing (read, or set the team mission as coordinator), memo (append to MEMORY.md project memory in the working directory), checkin (NON-BLOCKING status check: wake-DM everyone and end your turn — replies auto-wake you with progress, no sleeping/polling; use this for any 'what is everyone doing' question), await_members (BLOCKING wait: pass ALL member names at once comma-separated to wait until every one replies or the timeout — never call it once per member), later (set a self-ping timer: the harness wakes you with a turn at the given time — team later --minutes 30 --body '...' or --at HH:MM; timers persist across restarts and fire on next start if missed; list with team timers, cancel with team later --cancel <id>). Address recipients by member name or role:<role> (e.g. role:implementer). Reports go to role:coordinator by default. Tasks live on the team board; completing one REQUIRES evidence, is blocked on unfinished dependencies unless dep_override, and kind=review tasks gate a reviewed task (failure bounces it back to running).",
+      "Coordinate with other pi agents in your team (like a company): join teams, DM teammates, assign tasks, post reports, share a board, and track a structured task board. Actions: create, join, leave, roster, dm, broadcast, task, report, inbox, board_write, board_read, status, whoami, set_role, spawn, selftest, task_create, task_list, task_show, task_start, task_done, task_blocked, task_fail, task_assign, preset_show, preset_save, preset_create, revive, briefing (read, or set the team mission as coordinator), memo (append to MEMORY.md project memory in the working directory), checkin (NON-BLOCKING status check: wake-DM everyone and end your turn — replies auto-wake you with progress, no sleeping/polling; use this for any 'what is everyone doing' question), await_members (BLOCKING wait: pass ALL member names at once comma-separated to wait until every one replies or the timeout — never call it once per member), later (set a self-ping timer: the harness wakes you with a turn at the given time — team later --minutes 30 --body '...' or --at HH:MM; timers persist across restarts and fire on next start if missed; list with team timers, cancel with team later --cancel <id>), search (web search via the local SearXNG instance — team search 'query' [--count N] [--categories news]; available to every team, override the URL with team config --search_url <url>). Address recipients by member name or role:<role> (e.g. role:implementer). Reports go to role:coordinator by default. Tasks live on the team board; completing one REQUIRES evidence, is blocked on unfinished dependencies unless dep_override, and kind=review tasks gate a reviewed task (failure bounces it back to running).",
     promptSnippet: "Coordinate with teammate pi agents via team: DM, assign tasks, post reports, share a board, track tasks",
     promptGuidelines: [
       "Use team when the user wants multiple agents to work together or you need help from a teammate.",
@@ -1292,6 +1309,9 @@ export default function (pi: ExtensionAPI) {
       at: Type.Optional(Type.String({ description: "For later: ping me at this 24h time (HH:MM, e.g. 14:30)." })),
       cancel: Type.Optional(Type.String({ description: "For later: cancel a timer by id." })),
       auto_timers: Type.Optional(Type.String({ description: "For config (coordinator): standing cadence timers 'Name:minutes:body;Name2:30:body2' — auto-armed at session start, re-armed after each fire." })),
+      query: Type.Optional(Type.String({ description: "For search: the web query (SearXNG, local)." })),
+      count: Type.Optional(Type.Number({ description: "For search: max results (1-10, default 6)." })),
+      categories: Type.Optional(Type.String({ description: "For search: SearXNG categories, e.g. 'news,general'." })),
       timeout_minutes: Type.Optional(Type.Number({ description: "For await_members: max minutes to wait (1-30, default 3)." })),
       mode: Type.Optional(StringEnum(["all", "any"] as const)),
       preset: Type.Optional(Type.Array(Type.Object({ name: Type.String(), role: Type.Optional(Type.String()) }), { description: "For preset_create: the roster, e.g. [{name:'Optimus', role:'coordinator, reviewer'}, ...]. Roles may be comma-separated." })),
@@ -1397,6 +1417,23 @@ export default function (pi: ExtensionAPI) {
             const res = await bus.kickMember(root, me.team, name, { byId: me.id, byName: me.name, reason });
             if (!res.ok) return notify(`error: ${res.error}`);
             return notify(`Removed ${res.member.name} (${res.member.role}) from "${me.team}". Name is free again.`);
+          }
+          case "search": {
+            const me = await myTeam(c);
+            if (!me) return notify("You are not in a team.");
+            const q = argv._.slice(1).join(" ") || argv.q;
+            if (!q) return notify("Usage: /team search <query> [--count N] [--categories news]");
+            const meta = await bus.loadTeam(root, me.team).catch(() => null);
+            const res = await bus.searchWeb(q, {
+              count: parseFloat(argv.count || "6"),
+              categories: argv.categories || undefined,
+              teamMeta: meta,
+            });
+            if (!res.ok) return notify(`error: ${res.error}`);
+            return notify(
+              `Search (${res.count}) via ${res.base}:\n` +
+                res.results.map((r: any) => `- ${r.title}\n  ${r.url}\n  ${r.snippet}`).join("\n"),
+            );
           }
           case "later": {
             const me = await myTeam(c);
@@ -1599,6 +1636,12 @@ export default function (pi: ExtensionAPI) {
               const on = ar === "on" || ar === "true" || ar === "1";
               const res = await bus.setTeamSetting(root, me.team, { autoRespond: on });
               return notify(`autoRespond is now ${on ? "ON" : "OFF"} — idle members ${on ? "will" : "won't"} auto-start turns on DMs; wake-marked messages (dm --wake) always wake.`);
+            }
+            const su = argv["search-url"];
+            if (su !== undefined) {
+              if (!bus.hasRole(me.role, "coordinator")) return notify("Only a coordinator can change team settings.");
+              const res = await bus.setTeamSetting(root, me.team, { searchUrl: su });
+              return notify(`SearXNG URL for this team set to "${su}". (Default: env JCODE_SEARXNG_URL / SEARXNG_URL / http://127.0.0.1:8888.)`);
             }
             const at = argv["auto-timers"];
             if (at !== undefined) {

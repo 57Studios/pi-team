@@ -213,6 +213,7 @@ export async function setTeamSetting(root, team, patch) {
     const meta = await readJson(file, {});
     if (patch.autoRespond !== undefined) meta.autoRespond = Boolean(patch.autoRespond);
     if (patch.interject !== undefined) meta.interject = Boolean(patch.interject);
+    if (patch.searchUrl !== undefined) meta.searchUrl = String(patch.searchUrl).trim().slice(0, 300);
     if (patch.autoTimers !== undefined) {
       // Standing cadence timers: [{ name, minutes, body, tag }] — the
       // extension auto-arms them for the matching member at session start
@@ -443,6 +444,49 @@ export async function claimDueTimers(root, team, memberId, now = Date.now()) {
   all[memberId] = timers.filter((t) => t.dueAt > now);
   await writeTimers(root, team, all);
   return due;
+}
+
+// ---- web search via local SearXNG ----------------------------------------
+// Works for every team out of the box: resolves the SearXNG base URL from
+// (per-team team.json searchUrl) -> env (PI_TEAM_SEARXNG_URL, SEARXNG_URL,
+// JCODE_SEARXNG_URL) -> default http://127.0.0.1:8888.
+
+export function resolveSearchUrl(env = process.env, teamMeta = null) {
+  const fromTeam = teamMeta?.searchUrl?.trim();
+  if (fromTeam) return fromTeam.replace(/\/$/, "");
+  for (const k of ["PI_TEAM_SEARXNG_URL", "SEARXNG_URL", "JCODE_SEARXNG_URL"]) {
+    const v = env[k]?.trim();
+    if (v) return v.replace(/\/$/, "");
+  }
+  return "http://127.0.0.1:8888";
+}
+
+export async function searchWeb(query, { count = 6, categories, env = process.env, teamMeta = null, timeoutMs = 20_000 } = {}) {
+  const q = String(query || "").trim();
+  if (!q) return { ok: false, error: "query required" };
+  const base = resolveSearchUrl(env, teamMeta);
+  const params = new URLSearchParams({ q, format: "json", safesearch: "0" });
+  if (categories) params.set("categories", String(categories));
+  try {
+    const res = await fetch(`${base}/search?${params}`, {
+      signal: AbortSignal.timeout(timeoutMs),
+      headers: { Accept: "application/json" },
+    });
+    if (!res.ok) return { ok: false, error: `SearXNG ${base} returned HTTP ${res.status}` };
+    const data = await res.json();
+    const results = (data.results || [])
+      .filter((r) => r && r.url)
+      .slice(0, Math.max(1, Math.min(10, Number(count) || 6)))
+      .map((r) => ({
+        title: String(r.title || "").slice(0, 200),
+        url: String(r.url),
+        snippet: String(r.content || "").replace(/\s+/g, " ").trim().slice(0, 300),
+        engine: Array.isArray(r.engines) ? r.engines.join(",") : String(r.engine || ""),
+      }));
+    return { ok: true, base, count: results.length, results };
+  } catch (e) {
+    return { ok: false, error: `search failed (${base}): ${e?.message || e}` };
+  }
 }
 
 // ---- checkin records: non-blocking status checks -------------------------
