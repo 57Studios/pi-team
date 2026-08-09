@@ -176,7 +176,14 @@ function sanitizeName(name) {
 }
 
 function sanitizeRole(role) {
-  return String(role || "").trim().slice(0, 40) || "agent";
+  // Normalize separators: "coordinator,", "coordinator+reviewer", "coord, reviewer"
+  // all become "coordinator, reviewer". Handles naive tokenizers that split
+  // quoted multi-role values on spaces.
+  const tokens = String(role || "")
+    .split(/[,+]/)
+    .map((r) => r.trim())
+    .filter(Boolean);
+  return tokens.join(", ").slice(0, 40) || "agent";
 }
 
 // Normalize a role string to a set of role tokens. Roles are free-form but a
@@ -1037,4 +1044,28 @@ export async function refreshPresetFromRoster(root, team) {
     .filter((m) => m && m.name)
     .map((m) => ({ name: m.name, role: m.role || "agent" }));
   return savePreset(root, team, rows);
+}
+
+// ---------------------------------------------------------------------------
+// Standing briefing: the team mission / standing orders. Set by the
+// coordinator (team briefing --body "..."), injected into every member's
+// turn. Optional; when absent agents fall back to asking the coordinator.
+// ---------------------------------------------------------------------------
+
+export async function loadBrief(root, team) {
+  try {
+    const text = await fsp.readFile(path.join(teamDir(root, team), "brief.md"), "utf8");
+    return text.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveBrief(root, team, text) {
+  if (!(await teamExists(root, team))) {
+    return { ok: false, error: `Team "${team}" does not exist.` };
+  }
+  await writeTextAtomic(path.join(teamDir(root, team), "brief.md"), text);
+  await appendTeamLog(root, team, { ts: Date.now(), event: "brief_updated" });
+  return { ok: true };
 }

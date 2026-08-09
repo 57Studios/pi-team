@@ -35,7 +35,7 @@ const ACTIONS = [
   "inbox", "board_write", "board_read", "status", "whoami", "set_role",
   "spawn", "selftest",
   "task_create", "task_list", "task_show", "task_start", "task_done", "task_blocked", "task_fail", "task_assign",
-  "preset_show", "preset_save", "preset_create", "revive",
+  "preset_show", "preset_save", "preset_create", "revive", "briefing",
 ] as const;
 
 const TEAM_IDENTITY_ENTRY = "team-identity";
@@ -48,7 +48,6 @@ export default function (pi: ExtensionAPI) {
   let lastTeam: { root: string; team: string; id: string } | undefined;
   let watcher: fs.FSWatcher | undefined;
   let heartbeat: NodeJS.Timeout | undefined;
-  let lastRosterLine = "";
   let lastTouchAt = 0;
   const autoTurns: number[] = [];
 
@@ -151,6 +150,40 @@ export default function (pi: ExtensionAPI) {
   function rosterLine(team: string, members: ReturnType<typeof bus.rosterList>) {
     const parts = members.map((m) => `${m.name}(${m.role})`);
     return `[team:${team}] ${parts.join(", ")}`;
+  }
+
+  // The standing briefing every member sees at the start of every turn: who
+  // they are, the team mission, and — crucially — who they report to and where
+  // completed work goes next (derived from the roster, so it tracks role
+  // changes automatically).
+  function buildBriefing(
+    me: NonNullable<Awaited<ReturnType<typeof myTeam>>>,
+    members: Record<string, any>,
+    brief: string | null,
+  ): string {
+    const roster = bus.rosterList(members, me.id);
+    const coordinators = roster.filter((m) => bus.hasRole(m.role, "coordinator")).map((m) => m.name);
+    const reviewers = roster.filter((m) => bus.hasRole(m.role, "reviewer")).map((m) => m.name);
+    const lines = [`You are ${me.name} (${me.role}) in team "${me.team}".`];
+    if (brief?.trim()) {
+      lines.push(`Mission: ${brief.trim()}`);
+    } else {
+      lines.push(`Mission: not set yet — ask the coordinator${coordinators.length ? ` (${coordinators.join(", ")})` : ""} for the team's objectives, or check the board.`);
+    }
+    if (roster.length) {
+      lines.push(`Team: ${roster.map((m) => `${m.name}(${m.role})`).join(", ")}`);
+    }
+    lines.push(
+      `Report to: role:coordinator${coordinators.length ? ` (${coordinators.join(", ")})` : ""} — use team report for completion reports; task_blocked/task_fail auto-notify them.`,
+    );
+    if (reviewers.length) {
+      lines.push(
+        `Pass completed work to: role:reviewer (${reviewers.join(", ")}) — created review tasks land there and bounce failed work back to you.`,
+      );
+    } else {
+      lines.push("No reviewers on this team — the coordinator reviews completed work.");
+    }
+    return lines.join("\n");
   }
 
   function formatMessages(msgs: Array<Record<string, any>>): string {
@@ -322,7 +355,6 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, c) => {
     ctx = c;
-    lastRosterLine = "";
     lastTouchAt = 0;
     const me = await myTeam(c);
     if (me) {
@@ -353,7 +385,7 @@ export default function (pi: ExtensionAPI) {
     ctx = undefined;
   });
 
-  // Inject pending DMs + a one-line roster into the start of each turn.
+  // Inject pending DMs + the standing briefing into the start of each turn.
   pi.on("before_agent_start", async (_event, c) => {
     const me = await myTeam(c);
     if (!me) return;
@@ -361,21 +393,20 @@ export default function (pi: ExtensionAPI) {
     await refreshWidget(c, me);
     const msgs = await bus.drainInbox(me.root, me.team, me.id);
     const members = await bus.loadMembers(me.root, me.team);
-    const line = rosterLine(me.team, bus.rosterList(members, me.id));
+    const brief = await bus.loadBrief(me.root, me.team);
+    // Injected every turn so the role/mission/handoff protocol is standing
+    // context: it survives compaction and can never decay.
+    const briefing = buildBriefing(me, members, brief);
     const parts: string[] = [];
     if (msgs.length) parts.push(formatMessages(msgs));
-    if (line !== lastRosterLine) {
-      lastRosterLine = line;
-      parts.push(
-        `[team-context] ${line}\nYou are ${me.name} (${me.role}). Use the team tool to DM teammates, assign tasks (task), post reports (report), or share a board (board_write).`,
-      );
-    }
-    if (!parts.length) return;
+    parts.push(`[team-context] ${briefing}`);
     return {
       message: {
         customType: "team-briefing",
         content: parts.join("\n\n"),
-        display: true,
+        // DMs are worth showing in the transcript; the standing briefing is
+        // context-only so the TUI doesn't repeat it on every turn.
+        display: msgs.length > 0,
       },
     };
   });
@@ -679,6 +710,20 @@ export default function (pi: ExtensionAPI) {
         return `Preset for "${me.team}" set (${roster.length} member(s)). Revive it with team revive.`;
       }
 
+      case "briefing": {
+        if (!me) return notInTeam;
+        if (p.body !== undefined && String(p.body).trim()) {
+          if (!bus.hasRole(me.role, "coordinator")) {
+            return "error: only a coordinator can set the team briefing (team briefing --body \"...\"). Anyone can read it.";
+          }
+          await bus.saveBrief(root, me.team, String(p.body).trim());
+          return `Team briefing updated. It is injected into every member's next turn.`;
+        }
+        const brief = await bus.loadBrief(root, me.team);
+        const members = await bus.loadMembers(root, me.team);
+        return buildBriefing(me, members, brief);
+      }
+
       case "preset_show": {
         if (!me) return notInTeam;
         const preset = await bus.loadPreset(root, me.team);
@@ -737,7 +782,7 @@ export default function (pi: ExtensionAPI) {
     name: "team",
     label: "Team",
     description:
-      "Coordinate with other pi agents in your team (like a company): join teams, DM teammates, assign tasks, post reports, share a board, and track a structured task board. Actions: create, join, leave, roster, dm, broadcast, task, report, inbox, board_write, board_read, status, whoami, set_role, spawn, selftest, task_create, task_list, task_show, task_start, task_done, task_blocked, task_fail, task_assign, preset_show, preset_save, revive. Address recipients by member name or role:<role> (e.g. role:implementer). Reports go to role:coordinator by default. Tasks live on the team board; completing one REQUIRES evidence, is blocked on unfinished dependencies unless dep_override, and kind=review tasks gate a reviewed task (failure bounces it back to running).",
+      "Coordinate with other pi agents in your team (like a company): join teams, DM teammates, assign tasks, post reports, share a board, and track a structured task board. Actions: create, join, leave, roster, dm, broadcast, task, report, inbox, board_write, board_read, status, whoami, set_role, spawn, selftest, task_create, task_list, task_show, task_start, task_done, task_blocked, task_fail, task_assign, preset_show, preset_save, preset_create, revive, briefing (read, or set the team mission as coordinator). Address recipients by member name or role:<role> (e.g. role:implementer). Reports go to role:coordinator by default. Tasks live on the team board; completing one REQUIRES evidence, is blocked on unfinished dependencies unless dep_override, and kind=review tasks gate a reviewed task (failure bounces it back to running).",
     promptSnippet: "Coordinate with teammate pi agents via team: DM, assign tasks, post reports, share a board, track tasks",
     promptGuidelines: [
       "Use team when the user wants multiple agents to work together or you need help from a teammate.",
@@ -747,6 +792,7 @@ export default function (pi: ExtensionAPI) {
       "Use team task_done with task_id and evidence (what changed, file refs, validation) to complete a board task — evidence is required and unfinished dependencies block completion unless you pass dep_override with a reason.",
       "Use team report to send your completion report to role:coordinator after finishing assigned work.",
       "Use team roster to see teammates and roles; use team inbox to check for new messages mid-turn.",
+      "Every turn starts with a [team-context] briefing: your role, the mission, who to report to (role:coordinator), and where completed work goes (role:reviewer). Follow it.",
       "Use team board_write/board_read for shared design notes instead of long DMs.",
     ],
     parameters: Type.Object({
@@ -783,9 +829,15 @@ export default function (pi: ExtensionAPI) {
   // /team command (user-facing)
   // -------------------------------------------------------------------------
 
+  // Quote-aware tokenizer so `--role "coordinator, reviewer"` stays one value.
   function parseArgs(input: string): Record<string, string> & { _: string[] } {
     const out: Record<string, string> & { _: string[] } = { _: [] };
-    const tokens = input.trim().split(/\s+/).filter(Boolean);
+    const tokens: string[] = [];
+    const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(input.trim()))) {
+      tokens.push(m[1] ?? m[2] ?? m[3]);
+    }
     for (let i = 0; i < tokens.length; i++) {
       const t = tokens[i];
       if (t.startsWith("--")) {
@@ -892,6 +944,18 @@ export default function (pi: ExtensionAPI) {
             const res = await bus.pruneMembers(root, me.team, { olderThanMs });
             return notify(`Pruned ${res.removed} member(s) last seen more than ${hours > 0 ? hours + "h" : "3 min (dead)"} ago.`);
           }
+          case "briefing": {
+            const me = await myTeam(c);
+            if (!me) return notify("You are not in a team.");
+            if (argv.body) {
+              if (!bus.hasRole(me.role, "coordinator")) return notify("Only a coordinator can set the team briefing.");
+              await bus.saveBrief(root, me.team, argv.body);
+              return notify("Team briefing updated — injected into every member's next turn.");
+            }
+            const brief = await bus.loadBrief(root, me.team);
+            const members = await bus.loadMembers(root, me.team);
+            return notify(buildBriefing(me, members, brief));
+          }
           case "preset": {
             const me = await myTeam(c);
             if (!me) return notify("You are not in a team.");
@@ -993,6 +1057,7 @@ export default function (pi: ExtensionAPI) {
               "/team inbox                                   read pending messages",
               "/team set-role <role> / set-name <name>       update your role/name",
               "/team prune [--hours N]                       remove dead members (0 = dead only, default 24h)",
+              "/team briefing [--body \"...\"]               read / set the team mission (coordinator can set)",
               "/team preset [save]                           show/refresh the saved team (name + role)",
               "/team preset create N=role [N=role ...]        seed the preset from scratch (multi roles ok)",
               "/team revive [--prompt ...]                   spawn the whole preset team back in terminals",

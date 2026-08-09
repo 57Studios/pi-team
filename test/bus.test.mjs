@@ -215,6 +215,17 @@ const main = async () => {
     fs.rmSync(root2, { recursive: true, force: true });
   });
 
+  await t("standing briefing storage", async () => {
+    const root2 = path.join(root, "brief");
+    await bus.createTeam(root2, "b", {});
+    ok("no brief initially", (await bus.loadBrief(root2, "b")) === null);
+    const set = await bus.saveBrief(root2, "b", "Ship v2 by Friday. Quality over speed.");
+    ok("save brief", set.ok);
+    const got = await bus.loadBrief(root2, "b");
+    ok("load brief", got && got.includes("Friday"));
+    fs.rmSync(root2, { recursive: true, force: true });
+  });
+
   await t("multi-role members (comma-separated)", async () => {
     const root2 = path.join(root, "multirole");
     await bus.createTeam(root2, "m", {});

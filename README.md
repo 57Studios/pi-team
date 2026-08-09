@@ -51,13 +51,30 @@ injected at the start of his next turn, does the work, and sends
 
 ## What each side sees
 
+- **Standing briefing (every turn)** — each agent's turn starts with a
+  `[team-context]` block: who they are, the team mission, who they report to
+  (derived from the `coordinator` role), and where completed work goes next
+  (derived from the `reviewer` role). It is re-injected every turn so it
+  survives compaction and never decays. The mission is set by the coordinator:
+  `team briefing --body "..."` / `/team briefing --body "..."`.
 - **New DM while idle** → TUI notification (`[team:invader] 1 new message(s)...`).
 - **New DM at the start of a turn** → auto-injected into context as a
-  `[team inbox — N new messages]` block plus a one-line roster
-  (`[team:invader] Alice(coordinator), Bob(implementer), Carol(reviewer)`).
+  `[team inbox — N new messages]` block.
 - **New DM while mid-turn** → injected before the agent's next LLM call
   (soft interrupt, like jcode).
 - Agents can also check anytime with `team inbox` (via the `team` tool).
+
+Example briefing a worker sees:
+
+```
+[team-context] You are Bee (implementer) in team "invader".
+Mission: Ship the login flow; tests must pass.
+Team: Bee(implementer), Optimus(coordinator, reviewer)
+Report to: role:coordinator (Optimus) — use team report for completion reports;
+  task_blocked/task_fail auto-notify them.
+Pass completed work to: role:reviewer (Optimus) — created review tasks land
+  there and bounce failed work back to you.
+```
 
 ## The `team` tool (what agents call)
 
