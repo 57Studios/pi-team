@@ -35,7 +35,7 @@ const ACTIONS = [
   "inbox", "board_write", "board_read", "status", "whoami", "set_role",
   "spawn", "selftest",
   "task_create", "task_list", "task_show", "task_start", "task_done", "task_blocked", "task_fail", "task_assign",
-  "preset_show", "preset_save", "preset_create", "revive", "briefing", "memo", "config", "await_members", "kick",
+  "preset_show", "preset_save", "preset_create", "revive", "briefing", "memo", "config", "await_members", "kick", "checkin",
 ] as const;
 
 const TEAM_IDENTITY_ENTRY = "team-identity";
@@ -213,6 +213,7 @@ export default function (pi: ExtensionAPI) {
       );
       lines.push(
         "- To get an immediate answer from an idle member, mark the message wake: team dm --wake — idle members auto-start a turn for wake messages (rate-limited).",
+        "- Status checks are NON-BLOCKING: use team checkin (wake-DMs everyone, then END YOUR TURN). Replies auto-wake you one at a time with progress; never sleep or poll the inbox waiting for replies.",
       );
       if (researchers.length) {
         lines.push(
@@ -333,16 +334,20 @@ export default function (pi: ExtensionAPI) {
           if (!c.isIdle() && interject) {
             const msgs = await bus.drainInbox(me.root, me.team, me.id);
             if (msgs.length) {
+              const senders = msgs.map((m: any) => m.fromName).filter(Boolean);
+              const rec = await bus.recordCheckinReplies(me.root, me.team, me.id, senders);
               pi.sendMessage(
-                { customType: "team-briefing", content: formatMessages(msgs), display: true },
+                { customType: "team-briefing", content: formatMessages(msgs) + checkinProgressLine(rec), display: true },
                 { deliverAs: "steer" },
               );
             }
           } else if (c.isIdle() && (autoRespond || hasWake) && allowAutoTurn()) {
             const msgs = await bus.drainInbox(me.root, me.team, me.id);
             if (msgs.length) {
+              const senders = msgs.map((m: any) => m.fromName).filter(Boolean);
+              const rec = await bus.recordCheckinReplies(me.root, me.team, me.id, senders);
               pi.sendMessage(
-                { customType: "team-briefing", content: formatMessages(msgs), display: true },
+                { customType: "team-briefing", content: formatMessages(msgs) + checkinProgressLine(rec), display: true },
                 { triggerTurn: true, deliverAs: "followUp" },
               );
             }
@@ -581,6 +586,66 @@ export default function (pi: ExtensionAPI) {
       },
     };
   });
+
+  // Non-blocking status check: wake-DM the targets, record a checkin, and let
+  // replies auto-wake the sender with progress. No sleeping, no polling.
+  async function checkinMembers(
+    me: NonNullable<Awaited<ReturnType<typeof myTeam>>>,
+    { to = "", body = "" } = {},
+  ) {
+    const root = bus.teamsRoot(process.env); // helper lives outside the per-case root scope
+    const members = await bus.loadMembers(root, me.team);
+    // Member records have no `id` field — the id is the map key.
+    const others = Object.entries(members)
+      .filter(([id, m]: [string, any]) => m && id !== me.id && m.status !== "offline")
+      .map(([id, m]: [string, any]) => ({ id, ...m }));
+    const question = String(body || "").trim() || "Status check: reply with a one-line status of what you are working on.";
+    let ids: string[] = [];
+    let targetLabel = "";
+    if (to.trim()) {
+      const tgt = bus.resolveTargets(members, me.id, to);
+      if (tgt.error) return `error: ${tgt.error}`;
+      ids = tgt.ids;
+      targetLabel = to.trim();
+    } else {
+      ids = others.map((m: any) => m.id);
+      targetLabel = "all members";
+    }
+    const allNames = ids.map((id: string) => members[id]?.name).filter(Boolean);
+    if (!allNames.length) return "error: no valid targets (everyone may be offline — try team revive).";
+    await bus.sendMessage(root, me.team, {
+      type: "dm",
+      from: me.id,
+      fromName: me.name,
+      fromRole: me.role,
+      to: targetLabel, // recorded in the audit log so replies classify as replies (airtight wake)
+      subject: "status check",
+      body: question,
+      targets: ids,
+      wake: true,
+    });
+    // Progress tracks the reachable targets; offline members get the DM queued
+    // but don't block the checkin from completing.
+    const progressNames = allNames.filter((n) => others.some((m: any) => m.name === n));
+    await bus.setCheckin(root, me.team, me.id, { question, targets: progressNames });
+    const offline = Object.entries(members)
+      .filter(([id, m]: [string, any]) => m && id !== me.id && m.status === "offline")
+      .map(([, m]: [string, any]) => m.name);
+    const warn =
+      offline.length && !to.trim()
+        ? ` Offline (DM queued, not counted): ${offline.join(", ")} — team revive to wake them.`
+        : "";
+    return `Checkin sent to ${targetLabel} (${allNames.length}; wake: YES). Non-blocking: end this turn — each reply auto-wakes me with progress and I summarize when all have replied. Do NOT sleep or poll the inbox.${warn}`;
+  }
+
+  function checkinProgressLine(rec: any): string {
+    if (!rec || !rec.targets?.length) return "";
+    const missing = rec.targets.filter((n: string) => !rec.replied.includes(n));
+    if (missing.length === 0) {
+      return `\n[team-checkin] ALL ${rec.targets.length} members replied to your checkin ("${rec.question}") — produce the final status summary now.`;
+    }
+    return `\n[team-checkin] Checkin progress: ${rec.replied.length}/${rec.targets.length} replied. Still waiting on: ${missing.join(", ")}. Replies will wake you — no polling needed.`;
+  }
 
   // -------------------------------------------------------------------------
   // team tool (agent-facing)
@@ -930,6 +995,11 @@ export default function (pi: ExtensionAPI) {
         return buildBriefing(me, members, brief);
       }
 
+      case "checkin": {
+        if (!me) return notInTeam;
+        return await checkinMembers(me, { to: String(p.to || ""), body: String(p.body || "") });
+      }
+
       case "await_members": {
         if (!me) return notInTeam;
         const to = String(p.to || "").trim();
@@ -1026,7 +1096,7 @@ export default function (pi: ExtensionAPI) {
     name: "team",
     label: "Team",
     description:
-      "Coordinate with other pi agents in your team (like a company): join teams, DM teammates, assign tasks, post reports, share a board, and track a structured task board. Actions: create, join, leave, roster, dm, broadcast, task, report, inbox, board_write, board_read, status, whoami, set_role, spawn, selftest, task_create, task_list, task_show, task_start, task_done, task_blocked, task_fail, task_assign, preset_show, preset_save, preset_create, revive, briefing (read, or set the team mission as coordinator), memo (append to MEMORY.md project memory in the working directory), await_members (wait for replies with a timeout). Address recipients by member name or role:<role> (e.g. role:implementer). Reports go to role:coordinator by default. Tasks live on the team board; completing one REQUIRES evidence, is blocked on unfinished dependencies unless dep_override, and kind=review tasks gate a reviewed task (failure bounces it back to running).",
+      "Coordinate with other pi agents in your team (like a company): join teams, DM teammates, assign tasks, post reports, share a board, and track a structured task board. Actions: create, join, leave, roster, dm, broadcast, task, report, inbox, board_write, board_read, status, whoami, set_role, spawn, selftest, task_create, task_list, task_show, task_start, task_done, task_blocked, task_fail, task_assign, preset_show, preset_save, preset_create, revive, briefing (read, or set the team mission as coordinator), memo (append to MEMORY.md project memory in the working directory), checkin (NON-BLOCKING status check: wake-DM everyone and end your turn — replies auto-wake you with progress, no sleeping/polling; use this for any 'what is everyone doing' question), await_members (BLOCKING wait: pass ALL member names at once comma-separated to wait until every one replies or the timeout — never call it once per member). Address recipients by member name or role:<role> (e.g. role:implementer). Reports go to role:coordinator by default. Tasks live on the team board; completing one REQUIRES evidence, is blocked on unfinished dependencies unless dep_override, and kind=review tasks gate a reviewed task (failure bounces it back to running).",
     promptSnippet: "Coordinate with teammate pi agents via team: DM, assign tasks, post reports, share a board, track tasks",
     promptGuidelines: [
       "Use team when the user wants multiple agents to work together or you need help from a teammate.",
@@ -1036,7 +1106,7 @@ export default function (pi: ExtensionAPI) {
       "Use team task_done with task_id and evidence (what changed, file refs, validation) to complete a board task — evidence is required and unfinished dependencies block completion unless you pass dep_override with a reason.",
       "Use team report to send your completion report to role:coordinator after finishing assigned work (reports wake the coordinator automatically).",
       "If you intend to wake idle recipients, you MUST pass wake:true on the dm/task call — the tool result echoes whether wake was applied.",
-      "After sending wake DMs, use team await_members (to=..., timeout_minutes=...) to block until replies arrive or the timeout hits, instead of polling inbox manually.",
+      "For status checks use team checkin (to=..., body=...) — it is NON-BLOCKING: it wake-DMs everyone and you END YOUR TURN; each reply auto-wakes you with progress and you summarize when all have replied. NEVER use sleep or manual inbox polling to wait for team replies. Only when you truly must block in one turn, use team await_members passing ALL names at once (to='A, B, C', timeout_minutes=N) — one call waits for all of them; never call it once per member.",
       "Use team roster to see teammates and roles; use team inbox to check for new messages mid-turn.",
       "Every turn starts with a [team-context] briefing: your role, the mission, who to report to (role:coordinator), where completed work goes (role:reviewer), and the team protocol. Follow it.",
       "If your work crosses another member's scope, DM them directly to coordinate.",
@@ -1170,6 +1240,13 @@ export default function (pi: ExtensionAPI) {
             const res = await bus.kickMember(root, me.team, name, { byId: me.id, byName: me.name, reason });
             if (!res.ok) return notify(`error: ${res.error}`);
             return notify(`Removed ${res.member.name} (${res.member.role}) from "${me.team}". Name is free again.`);
+          }
+          case "checkin": {
+            const me = await myTeam(c);
+            if (!me) return notify("You are not in a team.");
+            const names = argv._.slice(1);
+            const body = argv.body || (names.length ? "" : undefined);
+            return notify(await checkinMembers(me, { to: names.join(", "), body: body || "" }));
           }
           case "leave": {
             const me = await myTeam(c);
@@ -1359,7 +1436,8 @@ export default function (pi: ExtensionAPI) {
               "/team prune [--hours N]                       remove dead members (0 = dead only, default 24h)",
               "/team kick <name> [reason]                  coordinator: remove a member from the team",
               "/team memo <text>                            append to MEMORY.md in this directory (project memory)",
-              "/team await <name|role:...> [--minutes N]     wait for replies (blocks until they arrive or timeout)",
+              "/team checkin [names...] [--body Q]       non-blocking status check (replies auto-wake you)",
+              "/team await <names...> [--minutes N]       BLOCKING: wait for ALL named members to reply (one call, all at once)",
               "/team briefing [--body \"...\"]               read / set the team mission (coordinator can set)",
               "/team preset [save]                           show/refresh the saved team (name + role)",
               "/team preset create N=role [N=role ...]        seed the preset from scratch (multi roles ok)",

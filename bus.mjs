@@ -312,6 +312,62 @@ export async function joinMember(root, team, { id, name, role, rejoin = false })
 // Coordinator action: remove a specific member by name (from the roster and
 // the preset). Frees their name; their own sessions may rejoin later (that is
 // a roster change the coordinator sees). Notifies the kicked member.
+// ---- checkin records: non-blocking status checks -------------------------
+// The coordinator sends wake DMs and ends its turn; replies auto-wake it and
+// the watcher records progress here so the coordinator never has to block or
+// poll. One pending checkin per coordinator (latest replaces).
+
+function checkinsFile(root, team) {
+  return path.join(teamDir(root, team), "checkins.json");
+}
+
+export async function setCheckin(root, team, byId, { question, targets }) {
+  const dir = teamDir(root, team);
+  await fs.promises.mkdir(dir, { recursive: true });
+  let all = {};
+  try {
+    all = JSON.parse(await fs.promises.readFile(checkinsFile(root, team), "utf8"));
+  } catch { /* first checkin */ }
+  all[byId] = { by: byId, question, targets, sentAt: Date.now(), replied: [] };
+  await writeJsonAtomic(checkinsFile(root, team), all);
+  return all[byId];
+}
+
+export async function recordCheckinReplies(root, team, byId, senders) {
+  const file = checkinsFile(root, team);
+  let all = {};
+  try {
+    all = JSON.parse(await fs.promises.readFile(file, "utf8"));
+  } catch { return null; }
+  const rec = all[byId];
+  if (!rec || !rec.targets?.length) return null;
+  let changed = false;
+  for (const name of senders) {
+    if (rec.targets.includes(name) && !rec.replied.includes(name)) {
+      rec.replied.push(name);
+      changed = true;
+    }
+  }
+  if (changed) await writeJsonAtomic(file, all);
+  return rec;
+}
+
+export async function getCheckin(root, team, byId) {
+  try {
+    const all = JSON.parse(await fs.promises.readFile(checkinsFile(root, team), "utf8"));
+    return all[byId] || null;
+  } catch { return null; }
+}
+
+export async function clearCheckin(root, team, byId) {
+  const file = checkinsFile(root, team);
+  try {
+    const all = JSON.parse(await fs.promises.readFile(file, "utf8"));
+    delete all[byId];
+    await writeJsonAtomic(file, all);
+  } catch { /* nothing to clear */ }
+}
+
 export async function kickMember(root, team, targetName, { byId, byName, reason } = {}) {
   const meta = await loadTeam(root, team);
   if (!meta) return { ok: false, error: `Team "${team}" does not exist.` };

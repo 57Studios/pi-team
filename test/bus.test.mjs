@@ -390,6 +390,32 @@ const main = async () => {
     fs.rmSync(root2, { recursive: true, force: true });
   });
 
+  await t("checkin records (non-blocking status checks)", async () => {
+    const root2 = path.join(root, "chk");
+    await bus.createTeam(root2, "c", {});
+    await bus.joinMember(root2, "c", { id: "a", name: "Alice", role: "coordinator" });
+    await bus.joinMember(root2, "c", { id: "b", name: "Bob", role: "implementer" });
+    await bus.joinMember(root2, "c", { id: "d", name: "Dora", role: "implementer" });
+    const rec = await bus.setCheckin(root2, "c", "a", { question: "status?", targets: ["Bob", "Dora"] });
+    ok("checkin created", rec && rec.targets.length === 2 && rec.replied.length === 0);
+    // replies recorded progressively (Bob first, then Dora)
+    let r = await bus.recordCheckinReplies(root2, "c", "a", ["Bob"]);
+    ok("first reply recorded", r.replied.length === 1 && r.replied[0] === "Bob");
+    r = await bus.recordCheckinReplies(root2, "c", "a", ["Dora", "Bob"]); // duplicate Bob ignored
+    ok("second reply recorded, dup ignored", r.replied.length === 2 && r.replied.includes("Dora"));
+    r = await bus.recordCheckinReplies(root2, "c", "a", ["Stranger"]);
+    ok("non-target sender ignored", r.replied.length === 2);
+    const got = await bus.getCheckin(root2, "c", "a");
+    ok("checkin read back", got && got.question === "status?" && got.replied.length === 2);
+    // replacing checkin resets progress
+    const rec2 = await bus.setCheckin(root2, "c", "a", { question: "second round", targets: ["Dora"] });
+    ok("re-checkin replaces and resets", rec2.replied.length === 0 && rec2.question === "second round");
+    // clear removes it
+    await bus.clearCheckin(root2, "c", "a");
+    ok("checkin cleared", (await bus.getCheckin(root2, "c", "a")) === null);
+    fs.rmSync(root2, { recursive: true, force: true });
+  });
+
   await t("project memory (MEMORY.md)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memo-"));
     // first append seeds the header
