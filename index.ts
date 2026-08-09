@@ -28,7 +28,7 @@ import { spawn } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
-import * as bus from "./bus.mjs";
+import * as bus from "./bus.ts";
 
 const ACTIONS = [
   "create", "join", "leave", "roster", "dm", "broadcast", "task", "report",

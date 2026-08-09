@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import * as bus from "../bus.mjs";
+import * as bus from "../bus.ts";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-team-bus-test-"));
 let passed = 0;

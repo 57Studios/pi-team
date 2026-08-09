@@ -397,7 +397,7 @@ Edit `~/.pi/teams/<team>/team.json`:
 ```
 ~/.pi/agent/extensions/pi-team/
 ├── index.ts          # the extension (tool, commands, events, injection)
-├── bus.mjs           # pure-JS message bus (no pi imports, unit-testable)
+├── bus.ts            # pure-TS message bus (no pi imports, unit-testable)
 ├── test/bus.test.mjs # node test/bus.test.mjs
 └── README.md
 ```

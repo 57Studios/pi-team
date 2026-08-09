@@ -7,6 +7,6 @@
   "license": "MIT",
   "keywords": ["pi", "extension", "agents", "team", "swarm", "multi-agent"],
   "scripts": {
-    "test": "node test/bus.test.mjs"
+    "test": "node --experimental-strip-types test/bus.test.mjs"
   }
 }
