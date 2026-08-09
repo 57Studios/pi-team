@@ -35,7 +35,7 @@ const ACTIONS = [
   "inbox", "board_write", "board_read", "status", "whoami", "set_role",
   "spawn", "selftest",
   "task_create", "task_list", "task_show", "task_start", "task_done", "task_blocked", "task_fail", "task_assign",
-  "preset_show", "preset_save", "preset_create", "revive", "briefing", "memo", "config", "await_members", "kick", "checkin", "later", "timers", "search",
+  "preset_show", "preset_save", "preset_create", "revive", "briefing", "memo", "config", "await_members", "kick", "checkin", "later", "timers", "search", "clear",
 ] as const;
 
 const TEAM_IDENTITY_ENTRY = "team-identity";
@@ -1185,6 +1185,14 @@ export default function (pi: ExtensionAPI) {
         return lines.join("\n");
       }
 
+      case "clear": {
+        if (!me) return notInTeam;
+        if (!bus.hasRole(me.role, "coordinator")) return "error: only a coordinator can clear the team board.";
+        const res = await bus.clearBoard(root, me.team, { clearTopics: p.board === true || p.all === true });
+        if (!res.ok) return `error: ${res.error}`;
+        return `Board cleared: archived ${res.archived} task${res.archived === 1 ? "" : "s"} (${res.done} done) to ${res.archive}${res.topicsCleared ? `; cleared ${res.topicsCleared} board topic(s)` : ""}. Team "${me.team}" is ready for a new project.`;
+      }
+
       case "checkin": {
         if (!me) return notInTeam;
         return await checkinMembers(me, { to: String(p.to || ""), body: String(p.body || "") });
@@ -1348,6 +1356,8 @@ export default function (pi: ExtensionAPI) {
       minutes: Type.Optional(Type.Number({ description: "For later: ping me in this many minutes." })),
       at: Type.Optional(Type.String({ description: "For later: ping me at this 24h time (HH:MM, e.g. 14:30)." })),
       cancel: Type.Optional(Type.String({ description: "For later: cancel a timer by id." })),
+      all: Type.Optional(Type.Boolean({ description: "For clear (coordinator): also wipe board topics, not just tasks." })),
+      board: Type.Optional(Type.Boolean({ description: "For clear (coordinator): also wipe board topics." })),
       auto_timers: Type.Optional(Type.String({ description: "For config (coordinator): standing cadence timers 'Name:minutes:body;Name2:30:body2' — auto-armed at session start, re-armed after each fire." })),
       query: Type.Optional(Type.String({ description: "For search: the web query (SearXNG, local)." })),
       count: Type.Optional(Type.Number({ description: "For search: max results (1-10, default 6)." })),
@@ -1502,6 +1512,14 @@ export default function (pi: ExtensionAPI) {
                 ? list.map((t: any) => `${t.id} @ ${new Date(t.dueAt).toTimeString().slice(0, 5)} — ${t.body || ""}`).join("\n")
                 : "No timers set. Use /team later <minutes> --body \"...\" to have the harness ping you.",
             );
+          }
+          case "clear": {
+            const me = await myTeam(c);
+            if (!me) return notify("You are not in a team.");
+            if (!bus.hasRole(me.role, "coordinator")) return notify("Only a coordinator can clear the team board.");
+            const res = await bus.clearBoard(root, me.team, { clearTopics: argv.all === "true" || argv.board === "true" });
+            if (!res.ok) return notify(`error: ${res.error}`);
+            return notify(`Board cleared: archived ${res.archived} task${res.archived === 1 ? "" : "s"} (${res.done} done) to ${res.archive}${res.topicsCleared ? `; cleared ${res.topicsCleared} board topic(s)` : ""}. Team "${me.team}" is ready for a new project.`);
           }
           case "checkin": {
             const me = await myTeam(c);
@@ -1724,6 +1742,7 @@ export default function (pi: ExtensionAPI) {
               "/team memo <text>                            append to MEMORY.md in this directory (project memory)",
               "/team later <min> [--body Q] [--at HH:MM]   set a self-ping timer (harness wakes you; --cancel <id> to remove)",
               "/team timers                               list your timers",
+              "/team clear [--all]                       coordinator: wipe the board (tasks archived first) for a new project",
               "/team checkin [names...] [--body Q]       non-blocking status check (replies auto-wake you)",
               "/team await <names...> [--minutes N]       BLOCKING: wait for ALL named members to reply (one call, all at once)",
               "/team briefing [--body \"...\"]               read / set the team mission (coordinator can set)",

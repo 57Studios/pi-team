@@ -49,6 +49,7 @@ completion auto-notifies the coordinator and spawns a research follow-up.
 
 ```
 /team create|join|leave|kick <name> [reason]   team lifecycle (kick = coordinator removes a member)
+/team clear [--all]                            coordinator: wipe the board to pivot the team to a new project (tasks archived first)
 /team roster | inbox | board | tasks            view state
 /team checkin [names...] [--body Q]             non-blocking status check
 /team later <min> [--body Q] [--at HH:MM]       self-ping timer (--cancel <id>, /team timers)

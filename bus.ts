@@ -995,6 +995,50 @@ export async function readLog(root, team, limit = 100) {
 
 export const TASK_STATUSES = ["queued", "running", "blocked", "failed", "done"];
 
+// Coordinator action: wipe the board so the team can pivot to a new project.
+// Tasks are ARCHIVED first (never destroyed): archive/tasks-<timestamp>.json.
+// Optionally also clears board topics (clearTopics). Audit-logged.
+export async function clearBoard(root, team, { clearTopics = false } = {}) {
+  return withTeamLock(root, team, async () => {
+    const dir = teamDir(root, team);
+    const tasks = await loadTasks(root, team);
+    const archiveDir = path.join(dir, "archive");
+    await fsp.mkdir(archiveDir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const archive = path.join(archiveDir, `tasks-${stamp}.json`);
+    await writeJsonAtomic(archive, { archivedAt: Date.now(), team, tasks });
+    await writeJsonAtomic(path.join(dir, "tasks.json"), { tasks: [] });
+    let topicsCleared = 0;
+    if (clearTopics) {
+      const boardDir = path.join(dir, "board");
+      try {
+        const entries = await fsp.readdir(boardDir);
+        for (const e of entries) {
+          if (e.endsWith(".md")) {
+            await fsp.unlink(path.join(boardDir, e));
+            topicsCleared++;
+          }
+        }
+      } catch { /* no board dir */ }
+    }
+    await appendTeamLog(root, team, {
+      ts: Date.now(),
+      event: "board_cleared",
+      archivedTasks: tasks.length,
+      doneTasks: tasks.filter((t) => t.status === "done").length,
+      archive,
+      clearTopics,
+    });
+    return {
+      ok: true,
+      archived: tasks.length,
+      done: tasks.filter((t) => t.status === "done").length,
+      topicsCleared,
+      archive,
+    };
+  });
+}
+
 export async function loadTasks(root, team) {
   const data = await readJson(path.join(teamDir(root, team), "tasks.json"), {
     tasks: [],

@@ -617,6 +617,36 @@ const main = async () => {
     fs.rmSync(root2, { recursive: true, force: true });
   });
 
+  await t("clearBoard (archive-first wipe for a new project)", async () => {
+    const root2 = path.join(root, "clr");
+    await bus.createTeam(root2, "c", {});
+    await bus.joinMember(root2, "c", { id: "a", name: "Alice", role: "coordinator" });
+    await bus.writeBoard(root2, "c", "design", "# notes");
+    const t1 = await bus.createTask(root2, "c", { title: "build", assignee: "Bob" });
+    const t2 = await bus.createTask(root2, "c", { title: "review" });
+    ok("tasks exist before clear", (await bus.loadTasks(root2, "c")).length === 2);
+    // mark one done via the normal flow (evidence + coordinator actor)
+    const done = await bus.updateTask(root2, "c", t1.task.id, { status: "done", evidence: "built and tested" }, { id: "a", name: "Alice", role: "coordinator" });
+    ok("task marked done", done.ok);
+    const res = await bus.clearBoard(root2, "c", { clearTopics: true });
+    ok("clear ok + archive counts", res.ok && res.archived === 2 && res.done === 1 && res.topicsCleared === 1);
+    ok("tasks wiped", (await bus.loadTasks(root2, "c")).length === 0);
+    ok("board topic wiped", (await bus.readBoard(root2, "c", "design")).ok === false);
+    // archive file exists with the tasks
+    const archive = await import("node:fs").then((m) => m.promises.readFile(res.archive, "utf8"));
+    const parsed = JSON.parse(archive);
+    ok("archive holds the tasks", parsed.tasks.length === 2 && parsed.team === "c");
+    // audit
+    const log = await bus.readLog(root2, "c", 50);
+    ok("board_cleared logged", log.some((e) => e.event === "board_cleared" && e.archivedTasks === 2));
+    // tasks-only clear (no topics) works after re-adding a topic
+    await bus.writeBoard(root2, "c", "ops", "x");
+    await bus.createTask(root2, "c", { title: "t3", status: "queued" });
+    const res2 = await bus.clearBoard(root2, "c", { clearTopics: false });
+    ok("tasks-only clear keeps topics", res2.ok && res2.topicsCleared === 0 && (await bus.readBoard(root2, "c", "ops")).ok === true);
+    fs.rmSync(root2, { recursive: true, force: true });
+  });
+
   await t("project memory (MEMORY.md)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memo-"));
     // first append seeds the header
