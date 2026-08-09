@@ -35,7 +35,7 @@ const ACTIONS = [
   "inbox", "board_write", "board_read", "status", "whoami", "set_role",
   "spawn", "selftest",
   "task_create", "task_list", "task_show", "task_start", "task_done", "task_blocked", "task_fail", "task_assign",
-  "preset_show", "preset_save", "preset_create", "revive", "briefing", "memo",
+  "preset_show", "preset_save", "preset_create", "revive", "briefing", "memo", "config",
 ] as const;
 
 const TEAM_IDENTITY_ENTRY = "team-identity";
@@ -210,6 +210,9 @@ export default function (pi: ExtensionAPI) {
       lines.push(
         "- If your work crosses another member's files/scope, DM them directly to coordinate and resolve conflicts — don't route everything through the coordinator.",
       );
+      lines.push(
+        "- To get an immediate answer from an idle member, mark the message wake: team dm --wake — idle members auto-start a turn for wake messages (rate-limited).",
+      );
       if (researchers.length) {
         lines.push(
           `- Research: whenever you need something searched, investigated, or fact-checked, DM role:researcher (${resNames}) with the question. They send the full report back to you and a tldr to the coordinator.${researchers.length && researchers.every(dead) ? " The researcher is currently offline — ask the coordinator to wake them (team revive)." : ""}`,
@@ -254,7 +257,7 @@ export default function (pi: ExtensionAPI) {
                       : "DM";
       const head = `${kind} from ${m.fromName || m.from} (${m.fromRole || "agent"})${
         m.subject ? ` — ${m.subject}` : ""
-      }${m.priority === "high" ? " [high priority]" : ""}`;
+      }${m.priority === "high" ? " [high priority]" : ""}${m.wake ? " [wake]" : ""}`;
       return `${head}\n${m.body || ""}`.trimEnd();
     });
     return `[team inbox — ${msgs.length} new message${msgs.length > 1 ? "s" : ""}]\n\n${blocks.join("\n\n")}`;
@@ -322,6 +325,7 @@ export default function (pi: ExtensionAPI) {
           if (!c) return;
           const pending = await bus.pendingCount(me.root, me.team, me.id);
           if (!pending) return;
+          const hasWake = await bus.hasWakePending(me.root, me.team, me.id);
           const meta = await bus.loadTeam(me.root, me.team);
           const autoRespond = meta?.autoRespond === true;
           const interject = meta?.interject !== false;
@@ -333,7 +337,7 @@ export default function (pi: ExtensionAPI) {
                 { deliverAs: "steer" },
               );
             }
-          } else if (c.isIdle() && autoRespond && allowAutoTurn()) {
+          } else if (c.isIdle() && (autoRespond || hasWake) && allowAutoTurn()) {
             const msgs = await bus.drainInbox(me.root, me.team, me.id);
             if (msgs.length) {
               pi.sendMessage(
@@ -660,6 +664,7 @@ export default function (pi: ExtensionAPI) {
           subject,
           body,
           priority: type === "task" ? "high" : "normal",
+          wake: p.wake === true,
           targets,
         });
         if (!sent.ok) return `error: ${sent.error}`;
@@ -815,6 +820,19 @@ export default function (pi: ExtensionAPI) {
         return buildBriefing(me, members, brief);
       }
 
+      case "config": {
+        if (!me) return notInTeam;
+        if (p.auto_respond !== undefined) {
+          if (!bus.hasRole(me.role, "coordinator")) {
+            return "error: only a coordinator can change team settings.";
+          }
+          const res = await bus.setTeamSetting(root, me.team, { autoRespond: p.auto_respond === true });
+          return `autoRespond is now ${res.team.autoRespond ? "ON" : "OFF"}. When ON, idle members auto-start a turn on DMs (rate-limited); messages marked wake (dm --wake) always wake them.`;
+        }
+        const meta = await bus.loadTeam(root, me.team);
+        return `Team "${me.team}" — autoRespond: ${meta?.autoRespond} | interject: ${meta?.interject}. Set with team config --auto_respond true|false.`;
+      }
+
       case "preset_show": {
         if (!me) return notInTeam;
         const preset = await bus.loadPreset(root, me.team);
@@ -908,6 +926,8 @@ export default function (pi: ExtensionAPI) {
       priority: Type.Optional(StringEnum(["normal", "high"] as const)),
       status: Type.Optional(Type.String({ description: "Status text for the status action (e.g. blocked on parser)." })),
       prompt: Type.Optional(Type.String({ description: "Kickoff prompt for the spawn action." })),
+      wake: Type.Optional(Type.Boolean({ description: "Wake the recipient(s) on dm/broadcast/task/report: an idle member starts a turn to act on it now (rate-limited). Use for urgent or status-check messages." })),
+      auto_respond: Type.Optional(Type.Boolean({ description: "For config: set team autoRespond (coordinator only)." })),
       preset: Type.Optional(Type.Array(Type.Object({ name: Type.String(), role: Type.Optional(Type.String()) }), { description: "For preset_create: the roster, e.g. [{name:'Optimus', role:'coordinator, reviewer'}, ...]. Roles may be comma-separated." })),
       dir: Type.Optional(Type.String({ description: "Team root directory override (default ~/.pi/teams)." })),
     }),
@@ -1140,6 +1160,13 @@ export default function (pi: ExtensionAPI) {
           case "config": {
             const me = await myTeam(c);
             if (!me) return notify("You are not in a team.");
+            const ar = argv["auto-respond"];
+            if (ar !== undefined) {
+              if (!bus.hasRole(me.role, "coordinator")) return notify("Only a coordinator can change team settings.");
+              const on = ar === "on" || ar === "true" || ar === "1";
+              const res = await bus.setTeamSetting(root, me.team, { autoRespond: on });
+              return notify(`autoRespond is now ${on ? "ON" : "OFF"} — idle members ${on ? "will" : "won't"} auto-start turns on DMs; wake-marked messages (dm --wake) always wake.`);
+            }
             const meta = await bus.loadTeam(root, me.team);
             const members = await bus.loadMembers(root, me.team);
             return notify(

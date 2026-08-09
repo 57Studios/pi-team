@@ -168,6 +168,22 @@ export async function loadTeam(root, team) {
   return { name: team, dir: teamDir(root, team), ...meta };
 }
 
+// Toggle team-level settings (autoRespond, interject). Coordinator-gated in
+// the tool/command layer.
+export async function setTeamSetting(root, team, patch) {
+  if (!(await teamExists(root, team))) {
+    return { ok: false, error: `Team "${team}" does not exist.` };
+  }
+  return withTeamLock(root, team, async () => {
+    const file = path.join(teamDir(root, team), "team.json");
+    const meta = await readJson(file, {});
+    if (patch.autoRespond !== undefined) meta.autoRespond = Boolean(patch.autoRespond);
+    if (patch.interject !== undefined) meta.interject = Boolean(patch.interject);
+    await writeJsonAtomic(file, meta);
+    return { ok: true, team: meta };
+  });
+}
+
 export async function loadMembers(root, team) {
   const data = await readJson(path.join(teamDir(root, team), "members.json"), {
     members: {},
@@ -441,6 +457,7 @@ export async function sendMessage(root, team, msg) {
     subject: msg.subject || null,
     body: msg.body || "",
     priority: msg.priority || "normal",
+    wake: msg.wake === true,
     replyTo: msg.replyTo || null,
   };
   let delivered = 0;
@@ -503,6 +520,28 @@ export async function pendingCount(root, team, memberId) {
   } catch {
     return 0;
   }
+}
+
+// True when any pending message is marked wake (the sender asked for an
+// immediate response even while idle).
+export async function hasWakePending(root, team, memberId) {
+  const dir = inboxDir(root, team, memberId);
+  let files = [];
+  try {
+    files = await fsp.readdir(dir);
+  } catch {
+    return false;
+  }
+  for (const f of files) {
+    if (!f.endsWith(".json") || f.includes(".tmp-")) continue;
+    try {
+      const msg = JSON.parse(await fsp.readFile(path.join(dir, f), "utf8"));
+      if (msg.wake === true) return true;
+    } catch {
+      /* skip broken files */
+    }
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------

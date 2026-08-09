@@ -277,6 +277,28 @@ const main = async () => {
     fs.rmSync(root2, { recursive: true, force: true });
   });
 
+  await t("wake flag + team settings", async () => {
+    const root2 = path.join(root, "wake");
+    await bus.createTeam(root2, "w", {});
+    await bus.joinMember(root2, "w", { id: "a", name: "Alice", role: "coordinator" });
+    await bus.joinMember(root2, "w", { id: "b", name: "Bob", role: "implementer" });
+    // normal dm: not wake
+    await bus.sendMessage(root2, "w", { type: "dm", from: "a", fromName: "Alice", fromRole: "coordinator", to: "Bob", body: "hi", targets: ["b"] });
+    ok("normal dm not wake", (await bus.hasWakePending(root2, "w", "b")) === false);
+    // wake dm
+    await bus.sendMessage(root2, "w", { type: "dm", from: "a", fromName: "Alice", fromRole: "coordinator", to: "Bob", body: "status check", wake: true, targets: ["b"] });
+    ok("wake dm detected", (await bus.hasWakePending(root2, "w", "b")) === true);
+    await bus.drainInbox(root2, "w", "b");
+    ok("wake cleared after drain", (await bus.hasWakePending(root2, "w", "b")) === false);
+    // settings toggle
+    const off = await bus.setTeamSetting(root2, "w", { autoRespond: false });
+    ok("autoRespond off persisted", off.ok && off.team.autoRespond === false);
+    const on = await bus.setTeamSetting(root2, "w", { autoRespond: true });
+    ok("autoRespond on persisted", on.ok && on.team.autoRespond === true);
+    ok("interject untouched", (await bus.loadTeam(root2, "w")).interject === true);
+    fs.rmSync(root2, { recursive: true, force: true });
+  });
+
   await t("project memory (MEMORY.md)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memo-"));
     // first append seeds the header

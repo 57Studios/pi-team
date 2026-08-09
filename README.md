@@ -84,8 +84,17 @@ with other harnesses' root-level `MEMORY.md` / `AGENTS.md` conventions:
   ghosts. The mission is set by the coordinator:
   `team briefing --body "..."` / `/team briefing --body "..."`.
 - **New DM while idle** → TUI notification (`[team:invader] 1 new message(s)...`).
+  Idle agents do **not** start work on their own — unless the message is
+  marked **`--wake`**, or team `autoRespond` is on.
+- **`team dm --wake` / `team task --wake`** → the recipient's pi **starts a
+  turn** even while idle, so urgent/status-check messages get actual replies
+  (rate-limited to ~3 auto-turns/min). This is the "nudge" for when the
+  coordinator needs an answer now.
+- **`/team config --auto-respond on|off`** (coordinator) → idle members
+  auto-start a turn whenever a DM arrives (rate-limited). Default off to avoid
+  surprise turns and ping-pong loops.
 - **New DM at the start of a turn** → auto-injected into context as a
-  `[team inbox — N new messages]` block.
+  `[team inbox — N new messages]` block (`[wake]` marked when applicable).
 - **New DM while mid-turn** → injected before the agent's next LLM call
   (soft interrupt, like jcode).
 - Agents can also check anytime with `team inbox` (via the `team` tool).
@@ -135,7 +144,7 @@ instructions. The coordinator can extend the mission text (`team briefing
 
 | Action | Purpose |
 |--------|---------|
-| `team dm <name\|role:R> --body "..."` | direct message a member or a role |
+| `team dm <name\|role:R> --body "..." [--wake]` | direct message a member or a role (`--wake` starts a turn on an idle recipient) |
 | `team task <name\|role:R> --subject S --body "..."` | assign work (high priority) |
 | `team report --body "..."` | send completion report to `role:coordinator` |
 | `team broadcast --body "..."` | message everyone |
