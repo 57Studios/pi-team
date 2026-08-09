@@ -1,0 +1,12 @@
+{
+  "name": "pi-team",
+  "version": "1.0.0",
+  "description": "Turn multiple pi agents into one coordinated team: DMs, tasks, reports, roles, shared board. No server.",
+  "type": "module",
+  "main": "index.ts",
+  "license": "MIT",
+  "keywords": ["pi", "extension", "agents", "team", "swarm", "multi-agent"],
+  "scripts": {
+    "test": "node test/bus.test.mjs"
+  }
+}

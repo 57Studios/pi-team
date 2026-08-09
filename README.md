@@ -6,8 +6,16 @@ just a shared folder and pi's extension hooks.
 
 ## Install
 
-Put this folder at `~/.pi/agent/extensions/pi-team/` and run `/reload` in pi.
-Verify with `/team selftest`.
+One command (clone/update into pi's auto-discovered extension directory):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/57Studios/pi-team/main/install.sh | bash
+```
+
+Then run `/reload` in pi and verify with `/team selftest`. No npm install
+needed — pi provides `typebox` and `@earendil-works/pi-tui` as built-in
+imports. Alternatively: `pi install git:github.com/57Studios/pi-team`, or
+clone this repo manually to `~/.pi/agent/extensions/pi-team/`.
 
 ## One-shot launch: `pi --team <name>`
 
