@@ -23,6 +23,19 @@ Put this directory at `~/.pi/agent/extensions/pi-team/` (already done if you're
 reading this there). It's auto-discovered; run `/reload` in pi if it was added
 while pi was running. Verify with `/team selftest`.
 
+## One-shot launch: `pi --team <name>`
+
+```
+pi --team alpha
+```
+
+From any terminal: this terminal **becomes the coordinator** (Optimus for
+Alpha — the first `coordinator`-role member of the preset) and **spawns every
+other preset member** in new terminals, each pre-joined with its name/role
+and titled `team / name (role)`. Members already live are skipped. Requires
+the preset to exist (`/team preset create` or previous joins). Note: use
+`--team` (double dash) — pi's parser rejects the single-dash `-team`.
+
 ## Quick start (3 terminals)
 
 **Terminal 1 — the coordinator:**

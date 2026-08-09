@@ -53,6 +53,7 @@ export default function (pi: ExtensionAPI) {
   // after compaction, or when the briefing content changed — not every prompt.
   let lastBriefingHash: number | null = null;
   let briefingDirty = false;
+  let launchedFromFlag = false;
   const autoTurns: number[] = [];
 
   // -------------------------------------------------------------------------
@@ -426,11 +427,97 @@ export default function (pi: ExtensionAPI) {
     briefingDirty = true;
   });
 
+  // One-shot launcher: `pi --team <name>` joins THIS terminal as the preset's
+  // coordinator (Optimus for Alpha) and spawns every other preset member in
+  // new terminals, pre-joined with their name/role.
+  async function launchFromFlag(c: ExtensionContext, team: string) {
+    if (launchedFromFlag) return;
+    launchedFromFlag = true;
+    const root = bus.teamsRoot(process.env);
+    let preset = null;
+    try {
+      preset = await bus.loadPreset(root, team);
+    } catch {
+      preset = null;
+    }
+    if (!preset?.members?.length) {
+      try {
+        c.ui.notify(`[team] No preset found for team "${team}". Create it first: /team preset create Optimus=coordinator, reviewer Bee=implementer ...`, "error");
+      } catch { /* ignore */ }
+      return;
+    }
+    // This terminal becomes the first coordinator-role member, else the first.
+    const coord = preset.members.find((m: any) => bus.hasRole(m.role, "coordinator")) || preset.members[0];
+    process.env.PI_TEAM = team;
+    process.env.PI_TEAM_NAME = coord.name;
+    process.env.PI_TEAM_ROLE = coord.role;
+    process.env.PI_TEAM_DIR = root;
+    const me = await myTeam(c);
+    if (!me) return;
+    startWatcher(me);
+    applyTitle(c, me);
+    await seedMemo(c, me);
+    await maybeSweep(me);
+    await refreshWidget(c, me, true);
+    // Spawn every other preset member that is not currently live.
+    const members = await bus.loadMembers(root, team).catch(() => ({}));
+    const now = Date.now();
+    const spawned: string[] = [];
+    const skipped: string[] = [];
+    for (const m of preset.members) {
+      if (m.name === me.name) continue;
+      const live = Object.values(members).some(
+        (x: any) => x.name === m.name && x.status !== "offline" && now - (x.lastSeen || 0) < bus.STALE_MEMBER_MS,
+      );
+      if (live) {
+        skipped.push(m.name);
+        continue;
+      }
+      await spawnWorker(me, { role: m.role, name: m.name }, c);
+      spawned.push(m.name);
+    }
+    try {
+      c.ui.notify(
+        `[team] Launched "${team}": you are ${me.name} (${me.role}). Spawned: ${spawned.join(", ") || "(none)"} · already live: ${skipped.join(", ") || "(none)"}`,
+        "info",
+      );
+    } catch { /* ignore */ }
+  }
+
+  pi.registerFlag("team", {
+    description: "Auto-launch a team on startup: this terminal joins as the preset's coordinator and spawns all other preset members in new terminals.",
+    type: "string",
+    default: "",
+  });
+
+  // pi's own extension-flag plumbing (unknownFlags -> applyExtensionFlagValues)
+  // is unreliable across reloads in non-interactive modes, so read the flag
+  // straight from the CLI argv. Supports --team <name> and --team=<name>.
+  function cliTeamFlag(): string {
+    const args = process.argv;
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (a === "--team") {
+        const v = args[i + 1];
+        if (v && !v.startsWith("-")) return v.trim();
+      } else if (a.startsWith("--team=")) {
+        return a.slice("--team=".length).trim();
+      }
+    }
+    return "";
+  }
+
   pi.on("session_start", async (_event, c) => {
     ctx = c;
     lastTouchAt = 0;
     lastBriefingHash = null;
     briefingDirty = false;
+    const argTeam = cliTeamFlag();
+    const flag = typeof argTeam === "string" && argTeam.trim() ? argTeam : pi.getFlag("team");
+    if (typeof flag === "string" && flag.trim() && !launchedFromFlag) {
+      await launchFromFlag(c, flag.trim());
+      return; // launchFromFlag already joined and set up the session
+    }
     const me = await myTeam(c);
     if (me) {
       startWatcher(me);
@@ -1249,6 +1336,7 @@ export default function (pi: ExtensionAPI) {
               "/team preset [save]                           show/refresh the saved team (name + role)",
               "/team preset create N=role [N=role ...]        seed the preset from scratch (multi roles ok)",
               "/team revive [--prompt ...]                   spawn the whole preset team back in terminals",
+              "pi --team <name>                            one-shot launcher: this terminal becomes the coordinator",
               "/team config                                  show team settings",
               "/team selftest                                run bus self-tests",
               "",
