@@ -420,16 +420,17 @@ export default function (pi: ExtensionAPI) {
           // new message (rate-limited), so nothing waits on a manual prompt.
           const autoRespond = meta?.autoRespond !== false;
           const interject = meta?.interject !== false;
+          const emitBriefing = (content: string, opts: Record<string, any>) => {
+            if (!content.trim()) return; // never send an empty team-briefing
+            pi.sendMessage({ customType: "team-briefing", content, display: true }, opts);
+          };
           if (!c.isIdle() && interject) {
             // Busy: steer the messages in before the next LLM call (soft interrupt).
             const msgs = await bus.drainInbox(me.root, me.team, me.id);
             if (msgs.length) {
               const senders = msgs.map((m: any) => m.fromName).filter(Boolean);
               const rec = await bus.recordCheckinReplies(me.root, me.team, me.id, senders);
-              pi.sendMessage(
-                { customType: "team-briefing", content: formatMessages(msgs) + checkinProgressLine(rec), display: true },
-                { deliverAs: "steer" },
-              );
+              emitBriefing(formatMessages(msgs) + checkinProgressLine(rec), { deliverAs: "steer" });
             }
           } else if (c.isIdle() && (autoRespond || hasWake)) {
             // Urgent messages (wake/report/task — wake is set by the sender or
@@ -440,10 +441,7 @@ export default function (pi: ExtensionAPI) {
               if (msgs.length) {
                 const senders = msgs.map((m: any) => m.fromName).filter(Boolean);
                 const rec = await bus.recordCheckinReplies(me.root, me.team, me.id, senders);
-                pi.sendMessage(
-                  { customType: "team-briefing", content: formatMessages(msgs) + checkinProgressLine(rec), display: true },
-                  { triggerTurn: true, deliverAs: "followUp" },
-                );
+                emitBriefing(formatMessages(msgs) + checkinProgressLine(rec), { triggerTurn: true, deliverAs: "followUp" });
               }
             } else {
               scheduleRetry(); // rate-limited: pick it up on the next window
@@ -690,10 +688,12 @@ export default function (pi: ExtensionAPI) {
       parts.push(briefingBlock);
     }
     if (!parts.length) return;
+    const content = parts.join("\n\n");
+    if (!content.trim()) return;
     return {
       message: {
         customType: "team-briefing",
-        content: parts.join("\n\n"),
+        content,
         display: true,
       },
     };
@@ -1724,7 +1724,19 @@ export default function (pi: ExtensionAPI) {
             : Array.isArray(content)
               ? content.map((p: any) => p?.text || "").join("\n")
               : "";
-        if (!text.trim()) return undefined; // never render an empty "[team]" block
+        if (!text.trim()) {
+          // Never render an empty "[team]" block — and do NOT return undefined
+          // (pi then falls back to its own "[team-briefing]" box with empty
+          // content). Return an invisible stub instead. Also log the empty
+          // render so we can trace its source if it ever happens again.
+          try {
+            fs.appendFileSync(
+              path.join(process.env.HOME || "/tmp", ".pi", "teams", ".pi-team-empty.log"),
+              `${new Date().toISOString()} empty team-briefing render (customType=${entry.customType})\n`,
+            );
+          } catch { /* best effort */ }
+          return new tui.Text("");
+        }
         const box = new tui.Box(1, 1, (t: string) => theme.bg("customMessageBg", t));
         box.addChild(new tui.Text(theme.bold("[team]")));
         const lines = text.split("\n");
