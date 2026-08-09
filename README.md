@@ -51,11 +51,14 @@ injected at the start of his next turn, does the work, and sends
 
 ## What each side sees
 
-- **Standing briefing (every turn)** — each agent's turn starts with a
-  `[team-context]` block: who they are, the team mission, who they report to
+- **Standing briefing (every agent run)** — each time an agent runs (every
+  user prompt, queued follow-up, or auto-triggered turn), its run starts with
+  a `[team-context]` block: who they are, the team mission, who they report to
   (derived from the `coordinator` role), and where completed work goes next
-  (derived from the `reviewer` role). It is re-injected every turn so it
-  survives compaction and never decays. The mission is set by the coordinator:
+  (derived from the `reviewer` role). The block is persistent in context for
+  the whole run, and re-injected at the start of each new run so it survives
+  compaction and never decays. It is not re-sent between individual tool calls
+  within a run. The mission is set by the coordinator:
   `team briefing --body "..."` / `/team briefing --body "..."`.
 - **New DM while idle** → TUI notification (`[team:invader] 1 new message(s)...`).
 - **New DM at the start of a turn** → auto-injected into context as a
