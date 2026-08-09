@@ -121,10 +121,17 @@ with other harnesses' root-level `MEMORY.md` / `AGENTS.md` conventions:
 - **New DM while mid-turn** → injected before the agent's next LLM call
   (soft interrupt, like jcode).
 - Agents can also check anytime with `team inbox` (via the `team` tool).
-- **`team await_members --to Bob --timeout_minutes 5`** (or
-  `/team await Bob --minutes 5 [--any]`) — blocks until the listed members
-  reply or the timeout hits, instead of manually polling the inbox and giving
-  up too early (the exact failure that stranded a late reply).
+- **`team checkin`** (or `/team checkin [names...] [--body Q]`) — the
+  **non-blocking** status check: wake-DMs everyone, you END YOUR TURN, and
+  each reply auto-wakes you with injected progress (`[team-checkin] 2/5
+  replied, still waiting on: ...`; `ALL N replied — produce the final status
+  summary` when done). Offline members get the DM queued but don't block
+  completion. Never sleep or poll the inbox waiting for replies.
+- **`team await_members --to "A, B, C" --timeout_minutes 5`** (or
+  `/team await A B C --minutes 5 [--any]`) — the BLOCKING variant, only when
+  you truly must stay in one turn: pass ALL names at once (comma-separated)
+  and it waits for every one of them or the timeout. Never call it once per
+  member — that is what produced the one-by-one wait.
 
 The briefing is **role-aware**: workers see the research/confidence protocol,
 and a member with the `researcher` role sees their *duty* instead.
