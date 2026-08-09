@@ -38,6 +38,32 @@ export function teamsRoot(env = process.env) {
   return v || TEAMS_ROOT_DEFAULT;
 }
 
+// Resolve a team name to its exact on-disk name (case-insensitive fuzzy
+// fallback), so `--team zilla` / `team join zilla` find "Zilla".
+export async function resolveTeamName(root, name) {
+  const exact = String(name || "").trim();
+  if (!exact) return null;
+  if (await pathExists(teamDir(root, exact))) return exact;
+  // root IS the teams directory (teamDir(root, team) === root/team).
+  let entries = [];
+  try {
+    entries = await fs.promises.readdir(root);
+  } catch {
+    return null;
+  }
+  const hit = entries.find((e) => e.toLowerCase() === exact.toLowerCase());
+  return hit || null;
+}
+
+async function pathExists(p) {
+  try {
+    await fs.promises.access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function teamDir(root, team) {
   return path.join(root, team);
 }
@@ -222,8 +248,23 @@ export function roleSet(role) {
     .filter(Boolean);
 }
 
+// Custom role names map to built-in capabilities so teams can use their own
+// vocabulary (e.g. Hub/Math/Executor/Scout for trading) and still get the
+// coordinator/planner/implementer/researcher/reviewer machinery.
+const ROLE_ALIASES = {
+  coordinator: ["hub", "boss", "lead", "manager", "captain", "conductor", "chief"],
+  planner: ["math", "strategist", "quant", "architect", "modeler"],
+  implementer: ["executor", "operator", "builder", "engineer", "coder", "worker"],
+  researcher: ["scout", "analyst", "investigator", "factfinder", "intel"],
+  reviewer: ["auditor", "veto", "critic", "inspector", "qa"],
+};
+
 export function hasRole(role, wanted) {
-  return roleSet(role).includes(String(wanted || "").trim().toLowerCase());
+  const w = String(wanted || "").trim().toLowerCase();
+  if (!w) return false;
+  const tokens = roleSet(role);
+  if (tokens.includes(w)) return true;
+  return (ROLE_ALIASES[w] || []).some((a) => tokens.includes(a));
 }
 
 // Lenient confidence parsing for task_done (jcode-style): word rungs, negations,

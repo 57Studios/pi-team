@@ -439,9 +439,11 @@ export default function (pi: ExtensionAPI) {
     if (launchedFromFlag) return;
     launchedFromFlag = true;
     const root = bus.teamsRoot(process.env);
+    // Case-insensitive team-name resolution: `--team zilla` finds "Zilla".
+    const resolved = (await bus.resolveTeamName(root, team)) || team;
     let preset = null;
     try {
-      preset = await bus.loadPreset(root, team);
+      preset = await bus.loadPreset(root, resolved);
     } catch {
       preset = null;
     }
@@ -453,7 +455,7 @@ export default function (pi: ExtensionAPI) {
     }
     // This terminal becomes the first coordinator-role member, else the first.
     const coord = preset.members.find((m: any) => bus.hasRole(m.role, "coordinator")) || preset.members[0];
-    process.env.PI_TEAM = team;
+    process.env.PI_TEAM = resolved;
     process.env.PI_TEAM_NAME = coord.name;
     process.env.PI_TEAM_ROLE = coord.role;
     process.env.PI_TEAM_DIR = root;
@@ -465,7 +467,7 @@ export default function (pi: ExtensionAPI) {
     await maybeSweep(me);
     await refreshWidget(c, me, true);
     // Spawn every other preset member that is not currently live.
-    const members = await bus.loadMembers(root, team).catch(() => ({}));
+    const members = await bus.loadMembers(root, resolved).catch(() => ({}));
     const now = Date.now();
     const spawned: string[] = [];
     const skipped: string[] = [];

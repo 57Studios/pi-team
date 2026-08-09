@@ -416,6 +416,39 @@ const main = async () => {
     fs.rmSync(root2, { recursive: true, force: true });
   });
 
+  await t("resolveTeamName (case-insensitive team names)", async () => {
+    const root2 = path.join(root, "names");
+    await bus.createTeam(root2, "Zilla", {});
+    ok("exact match", (await bus.resolveTeamName(root2, "Zilla")) === "Zilla");
+    ok("fuzzy lowercase", (await bus.resolveTeamName(root2, "zilla")) === "Zilla");
+    ok("fuzzy mixed case", (await bus.resolveTeamName(root2, "ZiLLa")) === "Zilla");
+    ok("unknown team -> null", (await bus.resolveTeamName(root2, "nope")) === null);
+    fs.rmSync(root2, { recursive: true, force: true });
+  });
+
+  await t("role aliases (custom role names keep capabilities)", async () => {
+    ok("Hub is a coordinator", bus.hasRole("Hub", "coordinator"));
+    ok("Math is a planner", bus.hasRole("Math", "planner"));
+    ok("Executor is an implementer", bus.hasRole("Executor", "implementer"));
+    ok("Scout is a researcher", bus.hasRole("Scout", "researcher"));
+    ok("Auditor is a reviewer", bus.hasRole("Auditor", "reviewer"));
+    ok("multi-role with custom name", bus.hasRole("Hub, reviewer", "reviewer"));
+    ok("case-insensitive", bus.hasRole("hub", "COORDINATOR"));
+    ok("exact roles still work", bus.hasRole("coordinator", "coordinator") && bus.hasRole("implementer", "implementer"));
+    ok("no false positive", !bus.hasRole("Scout", "coordinator") && !bus.hasRole("Math", "implementer"));
+    // fanout: role:coordinator resolves a Hub member
+    const root2 = path.join(root, "roles");
+    await bus.createTeam(root2, "r", {});
+    await bus.joinMember(root2, "r", { id: "z", name: "Zed", role: "Hub" });
+    await bus.joinMember(root2, "r", { id: "m", name: "Mint", role: "Math" });
+    const members = await bus.loadMembers(root2, "r");
+    const hubs = bus.resolveTargets(members, "m", "role:coordinator");
+    ok("role:coordinator resolves Hub", hubs.ids.length === 1 && hubs.ids[0] === "z");
+    const doers = bus.resolveTargets(members, "z", "role:implementer");
+    ok("role:implementer resolves none (no Executor)", doers.error);
+    fs.rmSync(root2, { recursive: true, force: true });
+  });
+
   await t("project memory (MEMORY.md)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memo-"));
     // first append seeds the header

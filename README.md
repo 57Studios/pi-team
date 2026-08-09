@@ -181,6 +181,7 @@ instructions. The coordinator can extend the mission text (`team briefing
 | `team task_assign --task_id T --to name\|role:R` | reassign (creator/coordinator only) |
 | `team spawn --role implementer --name Dave [--prompt "..."]` | open a new terminal running pi, pre-joined |
 | `team create/join/leave/kick/set_role/whoami` | team lifecycle (`kick` = coordinator removes a member; the kicked member gets a notice and their name frees up) |
+| **custom role names** | `hasRole` maps aliases to capabilities, so a team can name roles `Hub`, `Math`, `Executor`, `Scout` (coordinator, planner, implementer, researcher) and keep all machinery — briefing, report routing, kick gating, review gates, launch coordinator selection. Team names resolve case-insensitively (`pi --team zilla` → `Zilla`). |
 
 Addresses: a member **name** (unique per team) or **`role:<role>`** (fans out
 with that role, excluding the sender). `report` defaults to `role:coordinator`.
