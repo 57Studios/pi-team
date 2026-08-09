@@ -151,7 +151,19 @@ crashes. When you want the whole team back:
 /team revive            # coordinator: opens a terminal per preset member
 /team preset            # see who's in the preset
 /team preset save       # refresh it from the current live roster
+/team preset create N=role [N=role ...]   # seed the preset from scratch
 ```
+
+Seed a preset from scratch without anyone having joined yet — useful for
+defining a team before it exists:
+
+```
+/team preset create Optimus=coordinator, reviewer Bee=implementer Ghost=researcher
+```
+
+Roles are free-form and may be **comma-separated for multi-role members**
+(e.g. `coordinator, reviewer`): `role:<role>` addressing, coordinator
+escalation, and review-task permissions all honor every role a member holds.
 
 `revive` skips members who are already live, and spawns the rest in new
 terminals with their preset name/role baked into the env — they auto-join

@@ -179,6 +179,20 @@ function sanitizeRole(role) {
   return String(role || "").trim().slice(0, 40) || "agent";
 }
 
+// Normalize a role string to a set of role tokens. Roles are free-form but a
+// member may hold several (e.g. "coordinator, reviewer"); tokens are split on
+// commas/plus signs and matched case-insensitively.
+export function roleSet(role) {
+  return String(role || "")
+    .split(/[,+]/)
+    .map((r) => r.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+export function hasRole(role, wanted) {
+  return roleSet(role).includes(String(wanted || "").trim().toLowerCase());
+}
+
 export async function joinMember(root, team, { id, name, role, rejoin = false }) {
   const meta = await loadTeam(root, team);
   if (!meta) {
@@ -346,7 +360,7 @@ export function resolveTargets(members, selfId, to) {
   if (roleMatch) {
     const role = roleMatch[1].trim();
     const ids = Object.entries(members)
-      .filter(([id, m]) => m && m.role === role && id !== selfId)
+      .filter(([id, m]) => m && hasRole(m.role, role) && id !== selfId)
       .map(([id]) => id);
     if (!ids.length) {
       return { ids: [], error: `no other members with role "${role}"` };
@@ -560,6 +574,15 @@ export async function createTask(root, team, spec) {
           `reviewer assignment matches the reviewed task's assignee (${assignee}) — use a different role/name for an independent review`,
         );
       }
+      if (
+        reviewed.assignee?.startsWith("role:") &&
+        assignee?.startsWith("role:") &&
+        roleSet(reviewed.assignee.slice(5)).some((r) => roleSet(assignee.slice(5)).includes(r))
+      ) {
+        warnings.push(
+          `reviewer role overlaps the reviewed task's assignee roles (${assignee}) — use a different role for an independent review`,
+        );
+      }
     }
     const task = {
       id,
@@ -660,10 +683,10 @@ export async function updateTask(root, team, taskId, patch, actor) {
       }
       const isAssignee = task.assignee
         ? task.assignee.startsWith("role:")
-          ? actor.role === task.assignee.slice(5)
+          ? hasRole(actor.role, task.assignee.slice(5))
           : actor.name === task.assignee
         : true; // unassigned: claimable by anyone
-      const canManage = isAssignee || actor.role === "coordinator";
+      const canManage = isAssignee || hasRole(actor.role, "coordinator");
       if (!canManage) {
         return {
           ok: false,
@@ -858,7 +881,7 @@ export async function updateTask(root, team, taskId, patch, actor) {
       const to = String(patch.assignee).trim();
       if (!to) return { ok: false, error: "assignee cannot be empty" };
       const isCreator = task.createdBy === actor.id;
-      if (actor.role !== "coordinator" && !isCreator) {
+      if (!hasRole(actor.role, "coordinator") && !isCreator) {
         return { ok: false, error: "only the task creator or a coordinator may reassign" };
       }
       task.assignee = to;
@@ -984,7 +1007,7 @@ export async function savePreset(root, team, members) {
   await writeJsonAtomic(file, {
     name: team,
     savedAt: Date.now(),
-    members: members.map((m) => ({ name: m.name, role: m.role || "agent" })),
+    members: members.map((m) => ({ name: m.name, role: sanitizeRole(m.role) })),
   });
   return { ok: true };
 }

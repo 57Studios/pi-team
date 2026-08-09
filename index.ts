@@ -35,7 +35,7 @@ const ACTIONS = [
   "inbox", "board_write", "board_read", "status", "whoami", "set_role",
   "spawn", "selftest",
   "task_create", "task_list", "task_show", "task_start", "task_done", "task_blocked", "task_fail", "task_assign",
-  "preset_show", "preset_save", "revive",
+  "preset_show", "preset_save", "preset_create", "revive",
 ] as const;
 
 const TEAM_IDENTITY_ENTRY = "team-identity";
@@ -648,6 +648,18 @@ export default function (pi: ExtensionAPI) {
         return `Role updated to ${res.member.role}.`;
       }
 
+      case "preset_create": {
+        if (!me) return notInTeam;
+        const roster = Array.isArray(p.preset) ? p.preset : [];
+        if (!roster.length) return "error: preset required (array of {name, role}).";
+        await bus.savePreset(
+          root,
+          me.team,
+          roster.map((r: any) => ({ name: String(r.name || "").trim(), role: String(r.role || "agent").trim() })),
+        );
+        return `Preset for "${me.team}" set (${roster.length} member(s)). Revive it with team revive.`;
+      }
+
       case "preset_show": {
         if (!me) return notInTeam;
         const preset = await bus.loadPreset(root, me.team);
@@ -737,6 +749,7 @@ export default function (pi: ExtensionAPI) {
       priority: Type.Optional(StringEnum(["normal", "high"] as const)),
       status: Type.Optional(Type.String({ description: "Status text for the status action (e.g. blocked on parser)." })),
       prompt: Type.Optional(Type.String({ description: "Kickoff prompt for the spawn action." })),
+      preset: Type.Optional(Type.Array(Type.Object({ name: Type.String(), role: Type.Optional(Type.String()) }), { description: "For preset_create: the roster, e.g. [{name:'Optimus', role:'coordinator, reviewer'}, ...]. Roles may be comma-separated." })),
       dir: Type.Optional(Type.String({ description: "Team root directory override (default ~/.pi/teams)." })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, c) {
@@ -862,6 +875,18 @@ export default function (pi: ExtensionAPI) {
               await bus.refreshPresetFromRoster(root, me.team);
               return notify("Preset refreshed from the current roster.");
             }
+            if (sub === "create") {
+              // /team preset create Name=role Name=role ...
+              const pairs = argv._.slice(2);
+              if (!pairs.length) return notify("Usage: /team preset create Name=role [Name=role ...] (roles may be comma-separated)");
+              const roster = pairs.map((pair) => {
+                const [name, ...rest] = pair.split("=");
+                return { name: name.trim(), role: (rest.join("=") || "agent").trim() };
+              });
+              if (roster.some((r) => !r.name)) return notify("Each entry needs a name: /team preset create Optimus=coordinator, reviewer Bee=implementer");
+              await bus.savePreset(root, me.team, roster);
+              return notify(`Preset for "${me.team}" set (${roster.length} member(s)). Bring them back with /team revive.`);
+            }
             const preset = await bus.loadPreset(root, me.team);
             if (!preset?.members?.length) return notify("No preset yet — members are added automatically on join.");
             return notify(
@@ -944,6 +969,7 @@ export default function (pi: ExtensionAPI) {
               "/team set-role <role> / set-name <name>       update your role/name",
               "/team prune [--hours N]                       remove dead members (0 = dead only, default 24h)",
               "/team preset [save]                           show/refresh the saved team (name + role)",
+              "/team preset create N=role [N=role ...]        seed the preset from scratch (multi roles ok)",
               "/team revive [--prompt ...]                   spawn the whole preset team back in terminals",
               "/team config                                  show team settings",
               "/team selftest                                run bus self-tests",

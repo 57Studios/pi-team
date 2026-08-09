@@ -215,6 +215,23 @@ const main = async () => {
     fs.rmSync(root2, { recursive: true, force: true });
   });
 
+  await t("multi-role members (comma-separated)", async () => {
+    const root2 = path.join(root, "multirole");
+    await bus.createTeam(root2, "m", {});
+    await bus.joinMember(root2, "m", { id: "opt", name: "Optimus", role: "coordinator, reviewer" });
+    await bus.joinMember(root2, "m", { id: "bee", name: "Bee", role: "implementer" });
+    const members = await bus.loadMembers(root2, "m");
+    const asReviewer = bus.resolveTargets(members, "bee", "role:reviewer");
+    const asCoord = bus.resolveTargets(members, "bee", "role:coordinator");
+    ok("role:reviewer resolves to multi-role member", asReviewer.ids.length === 1 && asReviewer.ids[0] === "opt");
+    ok("role:coordinator resolves to multi-role member", asCoord.ids.length === 1 && asCoord.ids[0] === "opt");
+    const t = await bus.createTask(root2, "m", { title: "work", assignee: "role:implementer", createdBy: "opt", createdByName: "Optimus" });
+    const r = await bus.createTask(root2, "m", { title: "rev", kind: "review", reviewOf: t.task.id, assignee: "role:reviewer", createdBy: "opt", createdByName: "Optimus" });
+    const done = await bus.updateTask(root2, "m", r.task.id, { status: "done", evidence: "ok" }, { id: "opt", name: "Optimus", role: "coordinator, reviewer" });
+    ok("multi-role member passes review task", done.ok);
+    fs.rmSync(root2, { recursive: true, force: true });
+  });
+
   await t("concurrent joins do not lose members", async () => {
     const root2 = path.join(root, "concurrent");
     await bus.createTeam(root2, "team2", {});
