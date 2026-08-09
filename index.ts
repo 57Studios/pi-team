@@ -293,12 +293,16 @@ export default function (pi: ExtensionAPI) {
   }
 
   function allowAutoTurn(): boolean {
+    // Check the budget WITHOUT consuming a slot on no-op checks; only a
+    // granted auto-turn counts. Otherwise repeated watcher checks burn the
+    // 3/min budget and delay real messages.
     const now = Date.now();
-    autoTurns.push(now);
     const recent = autoTurns.filter((t) => now - t < 60_000);
+    if (recent.length >= 3) return false;
+    recent.push(now);
     autoTurns.length = 0;
     autoTurns.push(...recent);
-    return recent.length <= 3;
+    return true;
   }
 
   // Watch my inbox. New mail while busy -> steer-inject before the next LLM
@@ -323,7 +327,7 @@ export default function (pi: ExtensionAPI) {
       retryTimer = setTimeout(() => {
         retryTimer = undefined;
         watcherCheck();
-      }, 25_000);
+      }, 10_000);
     };
     // Heartbeat while in a team: lastSeen is a real liveness signal, so a
     // crashed/power-loss session releases its name once the heartbeat goes
@@ -332,13 +336,14 @@ export default function (pi: ExtensionAPI) {
     heartbeat = setInterval(() => {
       bus.touchMember(me.root, me.team, me.id).catch(() => {});
     }, bus.HEARTBEAT_MS);
-    // Keep the footer status live even with zero events: without this, a
-    // member that joined early and then sat idle would show a stale member
-    // count (e.g. "2 members" while the team grew to 4).
+    // Keep things live even with zero events: fs.watch can silently miss an
+    // inbox write, which stranded messages for minutes (Mint's report waited
+    // ~2.5 min once). A periodic full check guarantees a bounded reaction:
+    // drains new mail and auto-turns (rate-limited) the same way fs.watch
+    // does, plus refreshes the footer so member counts never go stale.
     if (widgetTimer) clearInterval(widgetTimer);
     widgetTimer = setInterval(() => {
-      const c = ctx;
-      if (c) refreshWidget(c, me).catch(() => {});
+      watcherCheck().catch(() => {});
     }, 30_000);
     const watcherCheck = async () => {
       if (busy) return;
@@ -366,7 +371,10 @@ export default function (pi: ExtensionAPI) {
               );
             }
           } else if (c.isIdle() && (autoRespond || hasWake)) {
-            if (allowAutoTurn()) {
+            // Urgent messages (wake/report/task — wake is set by the sender or
+            // the report path) always trigger a turn immediately: no budget
+            // wait, no retry. Only ordinary DMs are rate-limited.
+            if (hasWake || allowAutoTurn()) {
               const msgs = await bus.drainInbox(me.root, me.team, me.id);
               if (msgs.length) {
                 const senders = msgs.map((m: any) => m.fromName).filter(Boolean);
