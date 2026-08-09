@@ -1,27 +1,13 @@
 # pi-team
 
-Turn multiple pi instances into a coordinated **agent team** — agents DM each
-other, assign tasks, post reports, and share a board, with the roles you
-assign. Think jcode's swarm, but as a pi extension: no server, no ports, just a
-shared directory and pi's extension hooks.
-
-```
-┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-│  Alice       │  │  Bob         │  │  Carol       │
-│  (coordinator)│  │ (implementer)│  │  (reviewer)  │
-└──────┬───────┘  └──────┬───────┘  └──────┬───────┘
-       │  team dm/task   │  team report    │
-       └────────────────►└───────────────►└──────┘
-                          shared directory
-                        ~/.pi/teams/<team>/
-                        (members, inboxes, board, log)
-```
+Make multiple pi agents work as one team — they DM each other, assign tasks,
+post reports, and share a board, with roles you assign. No server, no ports:
+just a shared folder and pi's extension hooks.
 
 ## Install
 
-Put this directory at `~/.pi/agent/extensions/pi-team/` (already done if you're
-reading this there). It's auto-discovered; run `/reload` in pi if it was added
-while pi was running. Verify with `/team selftest`.
+Put this folder at `~/.pi/agent/extensions/pi-team/` and run `/reload` in pi.
+Verify with `/team selftest`.
 
 ## One-shot launch: `pi --team <name>`
 
