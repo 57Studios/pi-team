@@ -1,0 +1,949 @@
+/**
+ * pi-team: turn multiple pi instances into a coordinated agent team.
+ *
+ * Like jcode's swarm: instances join a team (with the roles you assign),
+ * DM each other, assign tasks, post reports, and share a board — all over a
+ * shared directory (~/.pi/teams/<team>), no server required.
+ *
+ * Install: put this directory at ~/.pi/agent/extensions/pi-team/ (auto-
+ * discovered, hot-reloadable with /reload).
+ *
+ * Usage:
+ *   /team create invader --name Alice --role coordinator   (instance 1)
+ *   /team join  invader --name Bob   --role implementer    (instance 2)
+ *   /team join  invader --name Carol --role reviewer       (instance 3)
+ *
+ * Agents coordinate via the `team` tool:
+ *   team dm Alice --body "..."          team task role:implementer --subject ... --body ...
+ *   team report --body "done"           team inbox / roster / board_write / board_read
+ *
+ * Spawned workers: PI_TEAM=<team> PI_TEAM_ROLE=<role> PI_TEAM_NAME=<name> pi
+ *   auto-joins on start (also used by `team spawn`).
+ */
+
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { spawn } from "node:child_process";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import { StringEnum } from "@earendil-works/pi-ai";
+import * as bus from "./bus.mjs";
+
+const ACTIONS = [
+  "create", "join", "leave", "roster", "dm", "broadcast", "task", "report",
+  "inbox", "board_write", "board_read", "status", "whoami", "set_role",
+  "spawn", "selftest",
+  "task_create", "task_list", "task_show", "task_start", "task_done", "task_blocked", "task_fail", "task_assign",
+] as const;
+
+const TEAM_IDENTITY_ENTRY = "team-identity";
+
+export default function (pi: ExtensionAPI) {
+  let ctx: ExtensionContext | undefined;
+  let memberId: string | undefined;
+  // Last team I belonged to, cached so session_shutdown can mark me offline
+  // (roster hygiene for teammates) without a full identity re-resolution.
+  let lastTeam: { root: string; team: string; id: string } | undefined;
+  let watcher: fs.FSWatcher | undefined;
+  let lastRosterLine = "";
+  let lastTouchAt = 0;
+  const autoTurns: number[] = [];
+
+  // -------------------------------------------------------------------------
+  // helpers
+  // -------------------------------------------------------------------------
+
+  function envCfg() {
+    return {
+      root: bus.teamsRoot(process.env),
+      team: process.env.PI_TEAM?.trim() || undefined,
+      role: process.env.PI_TEAM_ROLE?.trim() || undefined,
+      name: process.env.PI_TEAM_NAME?.trim() || undefined,
+    };
+  }
+
+  function safeSessionId(c: ExtensionContext): string {
+    try {
+      const id = c.sessionManager.getSessionId();
+      if (id) return id;
+    } catch {
+      /* fall through */
+    }
+    return `unknown-${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  // Session-scoped identity: recorded with pi.appendEntry on join, restored on
+  // session_start (survives restarts and /resume). /new starts fresh; rejoin
+  // with /team join (one command) or PI_TEAM env.
+  function sessionIdentity(c: ExtensionContext) {
+    try {
+      let entries: any[] = [];
+      try {
+        entries = c.sessionManager.getEntries();
+      } catch {
+        entries = c.sessionManager.getBranch();
+      }
+      for (const entry of entries) {
+        if (entry.type === "custom" && entry.customType === TEAM_IDENTITY_ENTRY) {
+          const d = entry.data as { root?: string; team?: string; name?: string; role?: string };
+          if (d && d.team && d.name) {
+            return {
+              root: d.root || bus.teamsRoot(process.env),
+              team: d.team,
+              name: d.name,
+              role: d.role || "agent",
+            };
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    return null;
+  }
+
+  // Resolve who I am: env override wins, else session identity. Auto-rejoins
+  // (reclaiming our name if a stale session holds it).
+  async function myTeam(c?: ExtensionContext) {
+    const c2 = c ?? ctx;
+    if (!c2) return null;
+    const cfg = envCfg();
+    const env = cfg.team
+      ? { root: cfg.root, team: cfg.team, name: cfg.name, role: cfg.role }
+      : null;
+    const ident = env || sessionIdentity(c2);
+    if (!ident) return null;
+    const root = ident.root;
+    if (!(await bus.teamExists(root, ident.team))) return null;
+    const id = safeSessionId(c2);
+    const jr = await bus.joinMember(root, ident.team, {
+      id,
+      name: ident.name,
+      role: ident.role,
+      rejoin: true,
+    });
+    if (!jr.ok) return null;
+    memberId = id;
+    lastTeam = { root, team: ident.team, id };
+    // Note: joinMember already resets status to "idle" on (re)join, so a
+    // resumed session implicitly revives from "offline".
+    return {
+      id,
+      root,
+      team: ident.team,
+      dir: bus.teamDir(root, ident.team),
+      name: jr.member.name,
+      role: jr.member.role,
+    };
+  }
+
+  function saveSessionIdentity(c: ExtensionContext, ident: { root: string; team: string; name: string; role: string }) {
+    try {
+      pi.appendEntry(TEAM_IDENTITY_ENTRY, ident);
+    } catch {
+      /* non-fatal */
+    }
+  }
+
+  function rosterLine(team: string, members: ReturnType<typeof bus.rosterList>) {
+    const parts = members.map((m) => `${m.name}(${m.role})`);
+    return `[team:${team}] ${parts.join(", ")}`;
+  }
+
+  function formatMessages(msgs: Array<Record<string, any>>): string {
+    const blocks = msgs.map((m) => {
+      const kind =
+        m.type === "task"
+          ? "TASK"
+          : m.type === "task_done"
+            ? "TASK DONE"
+            : m.type === "report"
+              ? "REPORT"
+              : m.type === "broadcast"
+                ? "BROADCAST"
+                : "DM";
+      const head = `${kind} from ${m.fromName || m.from} (${m.fromRole || "agent"})${
+        m.subject ? ` — ${m.subject}` : ""
+      }${m.priority === "high" ? " [high priority]" : ""}`;
+      return `${head}\n${m.body || ""}`.trimEnd();
+    });
+    return `[team inbox — ${msgs.length} new message${msgs.length > 1 ? "s" : ""}]\n\n${blocks.join("\n\n")}`;
+  }
+
+  async function throttledTouch(me: NonNullable<Awaited<ReturnType<typeof myTeam>>>) {
+    const now = Date.now();
+    if (now - lastTouchAt < 30_000) return;
+    lastTouchAt = now;
+    await bus.touchMember(me.root, me.team, me.id).catch(() => {});
+  }
+
+  function stopWatcher() {
+    if (watcher) {
+      try {
+        watcher.close();
+      } catch {
+        /* ignore */
+      }
+      watcher = undefined;
+    }
+  }
+
+  function allowAutoTurn(): boolean {
+    const now = Date.now();
+    autoTurns.push(now);
+    const recent = autoTurns.filter((t) => now - t < 60_000);
+    autoTurns.length = 0;
+    autoTurns.push(...recent);
+    return recent.length <= 3;
+  }
+
+  // Watch my inbox. New mail while busy -> steer-inject before the next LLM
+  // call (soft interrupt). New mail while idle -> notify; autoRespond setting
+  // optionally triggers a turn (rate-limited). before_agent_start drains
+  // whatever remains at the next prompt.
+  function startWatcher(me: NonNullable<Awaited<ReturnType<typeof myTeam>>>) {
+    stopWatcher();
+    const dir = bus.inboxDir(me.root, me.team, me.id);
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch {
+      return;
+    }
+    let timer: NodeJS.Timeout | undefined;
+    let busy = false;
+    watcher = fs.watch(dir, () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(async () => {
+        if (busy) return;
+        busy = true;
+        try {
+          const c = ctx;
+          if (!c) return;
+          const pending = await bus.pendingCount(me.root, me.team, me.id);
+          if (!pending) return;
+          const meta = await bus.loadTeam(me.root, me.team);
+          const autoRespond = meta?.autoRespond === true;
+          const interject = meta?.interject !== false;
+          if (!c.isIdle() && interject) {
+            const msgs = await bus.drainInbox(me.root, me.team, me.id);
+            if (msgs.length) {
+              pi.sendMessage(
+                { customType: "team-briefing", content: formatMessages(msgs), display: true },
+                { deliverAs: "steer" },
+              );
+            }
+          } else if (c.isIdle() && autoRespond && allowAutoTurn()) {
+            const msgs = await bus.drainInbox(me.root, me.team, me.id);
+            if (msgs.length) {
+              pi.sendMessage(
+                { customType: "team-briefing", content: formatMessages(msgs), display: true },
+                { triggerTurn: true, deliverAs: "followUp" },
+              );
+            }
+          } else {
+            if (c.hasUI) {
+              c.ui.notify(`[team:${me.team}] ${pending} new message(s) for you. Prompt your agent to read them.`, "info");
+            }
+          }
+        } catch {
+          /* watcher is best-effort */
+        } finally {
+          busy = false;
+        }
+      }, 250);
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // lifecycle
+  // -------------------------------------------------------------------------
+
+  pi.on("session_start", async (_event, c) => {
+    ctx = c;
+    lastRosterLine = "";
+    lastTouchAt = 0;
+    const me = await myTeam(c);
+    if (me) {
+      startWatcher(me);
+      if (c.hasUI) {
+        c.ui.notify(`[team:${me.team}] you are ${me.name} (${me.role}).`, "info");
+      }
+    }
+  });
+
+  pi.on("session_shutdown", () => {
+    stopWatcher();
+    // Mark myself offline in the roster so teammates see the truth. Uses the
+    // fully synchronous write (no await between lock and release) so pi cannot
+    // kill the process mid-operation and orphan the lock dir.
+    if (lastTeam) {
+      bus.setMemberStatusSync(lastTeam.root, lastTeam.team, lastTeam.id, "offline");
+    }
+    lastTeam = undefined;
+    ctx = undefined;
+  });
+
+  // Inject pending DMs + a one-line roster into the start of each turn.
+  pi.on("before_agent_start", async (_event, c) => {
+    const me = await myTeam(c);
+    if (!me) return;
+    await throttledTouch(me);
+    const msgs = await bus.drainInbox(me.root, me.team, me.id);
+    const members = await bus.loadMembers(me.root, me.team);
+    const line = rosterLine(me.team, bus.rosterList(members, me.id));
+    const parts: string[] = [];
+    if (msgs.length) parts.push(formatMessages(msgs));
+    if (line !== lastRosterLine) {
+      lastRosterLine = line;
+      parts.push(
+        `[team-context] ${line}\nYou are ${me.name} (${me.role}). Use the team tool to DM teammates, assign tasks (task), post reports (report), or share a board (board_write).`,
+      );
+    }
+    if (!parts.length) return;
+    return {
+      message: {
+        customType: "team-briefing",
+        content: parts.join("\n\n"),
+        display: true,
+      },
+    };
+  });
+
+  // -------------------------------------------------------------------------
+  // team tool (agent-facing)
+  // -------------------------------------------------------------------------
+
+  function formatTask(t: any, tasks: any[]): string {
+    const lines = [
+      `${t.id} [${t.status}] ${t.title}${t.priority === "high" ? " [high]" : ""}`,
+      t.body ? `Description: ${t.body}` : null,
+      t.assignee ? `Assignee: ${t.assignee}` : null,
+      t.createdByName ? `Created by: ${t.createdByName}` : null,
+      t.criteria?.length ? `Acceptance criteria:\n  - ${t.criteria.join("\n  - ")}` : null,
+      t.dependsOn?.length
+        ? `Depends on: ${t.dependsOn
+            .map((d: string) => {
+              const dep = tasks.find((x: any) => x.id === d);
+              return dep ? `${d} (${dep.status})` : `${d} (missing)`;
+            })
+            .join(", ")}`
+        : null,
+      t.evidence ? `Evidence:\n${t.evidence}` : null,
+      t.blockedReason ? `Blocked: ${t.blockedReason}` : null,
+      t.failReason ? `Failed: ${t.failReason}` : null,
+    ].filter(Boolean);
+    return lines.join("\n");
+  }
+
+  // Shared transition logic for task_start/blocked/fail/done. Returns the
+  // result text (with dependency warnings surfaced, and a DM to the creator on
+  // completion).
+  async function taskTransition(
+    me: NonNullable<Awaited<ReturnType<typeof myTeam>>>,
+    p: Record<string, any>,
+    to: string,
+  ): Promise<string> {
+    const root = p.dir?.trim() || bus.teamsRoot(process.env);
+    const tid = String(p.task_id || "").trim();
+    if (!tid) return "error: task_id required (task_id).";
+    const res = await bus.updateTask(
+      root,
+      me.team,
+      tid,
+      { status: to, reason: p.body, evidence: p.evidence },
+      { id: me.id, name: me.name, role: me.role },
+    );
+    if (!res.ok) return `error: ${res.error}`;
+    let out = `Task ${tid} -> ${to}.`;
+    if (res.warnings?.length) {
+      out += `\nWarning — unfinished dependencies: ${res.warnings.join(", ")}. Address them or note why they are not blocking.`;
+    }
+    if (res.notified) {
+      out += ` Notified ${res.notified} recipient(s).`;
+    }
+    return out;
+  }
+
+  async function handleAction(p: Record<string, any>, c: ExtensionContext): Promise<string> {
+    const root = p.dir?.trim() || bus.teamsRoot(process.env);
+    const me = await myTeam(c);
+    const id = safeSessionId(c);
+    const notInTeam = "error: you are not in a team. Create one (team create) or join one (team join).";
+
+    switch (p.action) {
+      case "create": {
+        const team = String(p.team || "").trim();
+        if (!team) return "error: team name required (team).";
+        const res = await bus.createTeam(root, team, { name: p.name });
+        if (!res.ok) return `error: ${res.error}`;
+        if (p.role || p.name) {
+          const jr = await bus.joinMember(root, team, { id, name: p.name, role: p.role });
+          if (!jr.ok) return `error: ${jr.error}`;
+          saveSessionIdentity(c, { root, team, name: jr.member.name, role: jr.member.role });
+          memberId = id;
+          const me2 = await myTeam(c);
+          if (me2) startWatcher(me2);
+          return `Team "${team}" ready at ${bus.teamDir(root, team)}. You joined as ${jr.member.name} (${jr.member.role}).\nTeammates join with: team join ${team} --role <their-role> --name <their-name>`;
+        }
+        return `Team "${team}" created at ${bus.teamDir(root, team)}. Join it with: team join ${team} --name <you> --role <role>`;
+      }
+
+      case "join": {
+        const team = String(p.team || "").trim();
+        if (!team) return "error: team name required (team).";
+        const jr = await bus.joinMember(root, team, { id, name: p.name, role: p.role });
+        if (!jr.ok) return `error: ${jr.error}`;
+        saveSessionIdentity(c, { root, team, name: jr.member.name, role: jr.member.role });
+        memberId = id;
+        const me2 = await myTeam(c);
+        if (me2) startWatcher(me2);
+        const members = await bus.loadMembers(root, team);
+        return `Joined team "${team}" as ${jr.member.name} (${jr.member.role}).\n${rosterLine(team, bus.rosterList(members, id))}`;
+      }
+
+      case "leave": {
+        if (!me) return notInTeam;
+        await bus.leaveMember(root, me.team, me.id);
+        stopWatcher();
+        return `Left team "${me.team}".`;
+      }
+
+      case "roster": {
+        if (!me) return notInTeam;
+        const members = await bus.loadMembers(root, me.team);
+        const rows = bus
+          .rosterList(members, me.id)
+          .map((m) => `- ${m.name} (${m.role}) — ${m.status || "idle"}${m.self ? " (you)" : ""}`);
+        return `Team "${me.team}" — ${Object.keys(members).length} member(s):\n${rows.join("\n")}`;
+      }
+
+      case "whoami": {
+        return me
+          ? `You are ${me.name} (${me.role}) in team "${me.team}" (team dir: ${me.dir}).`
+          : "You are not in a team.";
+      }
+
+      case "dm":
+      case "broadcast":
+      case "task":
+      case "report": {
+        if (!me) return notInTeam;
+        const body = String(p.body || "").trim();
+        if (!body) return "error: body required.";
+        let targets: string[];
+        let toLabel: string;
+        const members = await bus.loadMembers(root, me.team);
+        if (p.action === "broadcast") {
+          targets = Object.keys(members).filter((sid) => sid !== me.id);
+          toLabel = "everyone";
+        } else {
+          const to = p.action === "report" ? p.to || "role:coordinator" : p.to;
+          const res = bus.resolveTargets(members, me.id, to);
+          if (res.error) return `error: ${res.error}`;
+          targets = res.ids;
+          toLabel = to;
+        }
+        if (!targets.length) return "error: no recipients available.";
+        const type = p.action === "task" ? "task" : p.action === "report" ? "report" : p.action === "broadcast" ? "broadcast" : "dm";
+        const subject =
+          String(p.subject || "").trim() ||
+          (type === "task" ? "task assignment" : type === "report" ? "completion report" : "");
+        const sent = await bus.sendMessage(root, me.team, {
+          type,
+          from: me.id,
+          fromName: me.name,
+          fromRole: me.role,
+          to: toLabel,
+          subject,
+          body,
+          priority: type === "task" ? "high" : "normal",
+          targets,
+        });
+        if (!sent.ok) return `error: ${sent.error}`;
+        return `Sent ${type} to ${toLabel} (${sent.delivered} recipient${sent.delivered > 1 ? "s" : ""}).`;
+      }
+
+      case "inbox": {
+        if (!me) return notInTeam;
+        const msgs = await bus.drainInbox(root, me.team, me.id);
+        if (!msgs.length) return "Inbox empty.";
+        return formatMessages(msgs);
+      }
+
+      case "board_write": {
+        if (!me) return notInTeam;
+        const topic = String(p.topic || "").trim();
+        if (!topic) return "error: topic required for board_write.";
+        const res = await bus.writeBoard(root, me.team, topic, p.body);
+        return res.ok ? `Board "${topic}" updated.` : `error: ${res.error}`;
+      }
+
+      case "board_read": {
+        if (!me) return notInTeam;
+        const res = await bus.readBoard(root, me.team, p.topic);
+        if (!res.ok) return `error: ${res.error}`;
+        if (p.topic) return `# ${res.topic}\n\n${res.content}`;
+        return `Board topics: ${res.topics.length ? res.topics.join(", ") : "(empty)"}`;
+      }
+
+      // ---- task board (structured tasks; done requires evidence) ----
+
+      case "task_create": {
+        if (!me) return notInTeam;
+        const title = String(p.subject || "").trim();
+        if (!title) return "error: task title required (subject).";
+        const criteria = Array.isArray(p.criteria)
+          ? p.criteria.map(String)
+          : String(p.criteria || "").split(/\n|;/).map((s) => s.trim()).filter(Boolean);
+        const dependsOn = Array.isArray(p.depends_on) ? p.depends_on.map(String) : [];
+        const assignee = p.to ? String(p.to).trim() : null;
+        const res = await bus.createTask(root, me.team, {
+          title,
+          body: p.body,
+          assignee,
+          criteria,
+          dependsOn,
+          priority: p.priority,
+          createdBy: me.id,
+          createdByName: me.name,
+        });
+        if (!res.ok) return `error: ${res.error}`;
+        const notice = res.notified ? ` Notified ${res.notified} assignee(s).` : "";
+        return `Created task ${res.task.id} [${res.task.status}]: ${title}${assignee ? ` -> ${assignee}` : ""}.${notice}`;
+      }
+
+      case "task_list": {
+        if (!me) return notInTeam;
+        const tasks = await bus.loadTasks(root, me.team);
+        if (!tasks.length) return "Task board empty. Create tasks with team task_create.";
+        return tasks
+          .map((t: any) => `[${t.status}] ${t.id} — ${t.title}${t.assignee ? ` (-> ${t.assignee})` : ""}`)
+          .join("\n");
+      }
+
+      case "task_show": {
+        if (!me) return notInTeam;
+        const tid = String(p.task_id || "").trim();
+        if (!tid) return "error: task_id required.";
+        const tasks = await bus.loadTasks(root, me.team);
+        const t = tasks.find((x: any) => x.id === tid);
+        if (!t) return `error: unknown task "${tid}"`;
+        return formatTask(t, tasks);
+      }
+
+      case "task_start":
+        return taskTransition(me, p, "running");
+      case "task_blocked":
+        return taskTransition(me, p, "blocked");
+      case "task_fail":
+        return taskTransition(me, p, "failed");
+      case "task_done":
+        return taskTransition(me, p, "done");
+
+      case "task_assign": {
+        if (!me) return notInTeam;
+        const tid = String(p.task_id || "").trim();
+        if (!tid) return "error: task_id required.";
+        if (!p.to) return "error: to required (new assignee name or role:<role>).";
+        const res = await bus.updateTask(
+          root,
+          me.team,
+          tid,
+          { assignee: String(p.to).trim() },
+          { id: me.id, name: me.name, role: me.role },
+        );
+        if (!res.ok) return `error: ${res.error}`;
+        return `Task ${tid} reassigned to ${res.task.assignee}.`;
+      }
+
+      case "status": {
+        if (!me) return notInTeam;
+        await bus.touchMember(root, me.team, me.id, {
+          status: String(p.status || "").trim() || "idle",
+        });
+        return "Status updated.";
+      }
+
+      case "set_role": {
+        if (!me) return notInTeam;
+        if (!p.role) return "error: role required for set_role.";
+        const res = await bus.setMemberRole(root, me.team, me.id, p.role);
+        if (!res.ok) return `error: ${res.error}`;
+        saveSessionIdentity(c, { root, team: me.team, name: me.name, role: res.member.role });
+        return `Role updated to ${res.member.role}.`;
+      }
+
+      case "spawn": {
+        if (!me) return notInTeam;
+        return spawnWorker(me, p, c);
+      }
+
+      case "selftest":
+        return runSelftest();
+
+      default:
+        return `error: unknown action "${p.action}". Actions: ${ACTIONS.join(", ")}`;
+    }
+  }
+
+  pi.registerTool({
+    name: "team",
+    label: "Team",
+    description:
+      "Coordinate with other pi agents in your team (like a company): join teams, DM teammates, assign tasks, post reports, share a board, and track a structured task board. Actions: create, join, leave, roster, dm, broadcast, task, report, inbox, board_write, board_read, status, whoami, set_role, spawn, selftest, task_create, task_list, task_show, task_start, task_done, task_blocked, task_fail, task_assign. Address recipients by member name or role:<role> (e.g. role:implementer). Reports go to role:coordinator by default. Tasks live on the team board; completing one REQUIRES evidence.",
+    promptSnippet: "Coordinate with teammate pi agents via team: DM, assign tasks, post reports, share a board, track tasks",
+    promptGuidelines: [
+      "Use team when the user wants multiple agents to work together or you need help from a teammate.",
+      "Use team task with role:<role> or a member name to assign work; always include a subject and body.",
+      "Prefer team task_create for anything with multiple steps: it records the task on the team board with status, acceptance criteria, and evidence. team task is the lightweight DM version.",
+      "Use team task_done with task_id and evidence (what changed, file refs, validation) to complete a board task — evidence is required.",
+      "Use team report to send your completion report to role:coordinator after finishing assigned work.",
+      "Use team roster to see teammates and roles; use team inbox to check for new messages mid-turn.",
+      "Use team board_write/board_read for shared design notes instead of long DMs.",
+    ],
+    parameters: Type.Object({
+      action: StringEnum(ACTIONS),
+      team: Type.Optional(Type.String({ description: "Team name (required for create/join)." })),
+      role: Type.Optional(Type.String({ description: "Role for create/join/set_role/spawn, e.g. coordinator, architect, implementer, reviewer." })),
+      name: Type.Optional(Type.String({ description: "Your friendly member name (unique in team) for create/join/spawn." })),
+      to: Type.Optional(Type.String({ description: "Recipient for dm/task/report: a member name or role:<role>." })),
+      subject: Type.Optional(Type.String({ description: "Short subject (required for tasks)." })),
+      body: Type.Optional(Type.String({ description: "Message body for dm/broadcast/task/report; board content for board_write." })),
+      topic: Type.Optional(Type.String({ description: "Board topic for board_write/board_read." })),
+      task_id: Type.Optional(Type.String({ description: "Task id for task_show/task_start/task_done/task_blocked/task_fail/task_assign." })),
+      criteria: Type.Optional(Type.Array(Type.String(), { description: "Acceptance criteria for task_create (array or newline/;-separated text)." })),
+      evidence: Type.Optional(Type.String({ description: "Required for task_done: what changed (file refs), validation run." })),
+      depends_on: Type.Optional(Type.Array(Type.String(), { description: "Task ids this task depends on (task_create)." })),
+      priority: Type.Optional(StringEnum(["normal", "high"] as const)),
+      status: Type.Optional(Type.String({ description: "Status text for the status action (e.g. blocked on parser)." })),
+      prompt: Type.Optional(Type.String({ description: "Kickoff prompt for the spawn action." })),
+      dir: Type.Optional(Type.String({ description: "Team root directory override (default ~/.pi/teams)." })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, c) {
+      const text = await handleAction(params as Record<string, any>, c).catch((e: any) => {
+        return `team error: ${e?.message ?? e}`;
+      });
+      return { content: [{ type: "text", text }], details: {} };
+    },
+  });
+
+  // -------------------------------------------------------------------------
+  // /team command (user-facing)
+  // -------------------------------------------------------------------------
+
+  function parseArgs(input: string): Record<string, string> & { _: string[] } {
+    const out: Record<string, string> & { _: string[] } = { _: [] };
+    const tokens = input.trim().split(/\s+/).filter(Boolean);
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i];
+      if (t.startsWith("--")) {
+        const eq = t.indexOf("=");
+        if (eq > 0) {
+          out[t.slice(2, eq)] = t.slice(eq + 1);
+        } else {
+          const key = t.slice(2);
+          const next = tokens[i + 1];
+          if (next && !next.startsWith("--")) {
+            out[key] = next;
+            i++;
+          } else {
+            out[key] = "true";
+          }
+        }
+      } else {
+        out._.push(t);
+      }
+    }
+    return out;
+  }
+
+  pi.registerCommand("team", {
+    description:
+      "Manage your agent team: create/join/leave, roster, inbox, set-role, config, selftest. Usage: /team <create|join|leave|roster|inbox|set-role|set-name|config|selftest|help> [args]",
+    handler: async (args, c) => {
+      const argv = parseArgs(args);
+      const sub = argv._[0] || "help";
+      const root = argv.dir?.trim() || bus.teamsRoot(process.env);
+      const id = safeSessionId(c);
+      const notify = (msg: string) => {
+        if (c.hasUI) c.ui.notify(msg, "info");
+      };
+      try {
+        switch (sub) {
+          case "create": {
+            const team = argv._[1];
+            if (!team) return notify("Usage: /team create <name> [--name You] [--role R] [--dir PATH]");
+            const res = await bus.createTeam(root, team, { name: argv.name });
+            if (!res.ok) return notify(`error: ${res.error}`);
+            if (argv.name || argv.role) {
+              const jr = await bus.joinMember(root, team, { id, name: argv.name, role: argv.role });
+              if (!jr.ok) return notify(`error: ${jr.error}`);
+              saveSessionIdentity(c, { root, team, name: jr.member.name, role: jr.member.role });
+              memberId = id;
+              const me = await myTeam(c);
+              if (me) startWatcher(me);
+              return notify(`Team "${team}" created. You joined as ${jr.member.name} (${jr.member.role}).`);
+            }
+            return notify(`Team "${team}" created at ${bus.teamDir(root, team)}.`);
+          }
+          case "join": {
+            const team = argv._[1];
+            if (!team) return notify("Usage: /team join <name> [--name You] [--role R] [--dir PATH]");
+            const jr = await bus.joinMember(root, team, { id, name: argv.name, role: argv.role });
+            if (!jr.ok) return notify(`error: ${jr.error}`);
+            saveSessionIdentity(c, { root, team, name: jr.member.name, role: jr.member.role });
+            memberId = id;
+            const me = await myTeam(c);
+            if (me) startWatcher(me);
+            return notify(`Joined "${team}" as ${jr.member.name} (${jr.member.role}).`);
+          }
+          case "leave": {
+            const me = await myTeam(c);
+            if (!me) return notify("You are not in a team.");
+            await bus.leaveMember(root, me.team, me.id);
+            stopWatcher();
+            return notify(`Left team "${me.team}".`);
+          }
+          case "roster": {
+            const me = await myTeam(c);
+            if (!me) return notify("You are not in a team.");
+            const members = await bus.loadMembers(root, me.team);
+            const rows = bus
+              .rosterList(members, me.id)
+              .map((m) => `- ${m.name} (${m.role}) — ${m.status || "idle"}${m.self ? " (you)" : ""}`);
+            return notify(`Team "${me.team}":\n${rows.join("\n")}`);
+          }
+          case "tasks": {
+            const me = await myTeam(c);
+            if (!me) return notify("You are not in a team.");
+            const tasks = await bus.loadTasks(root, me.team);
+            if (!tasks.length) return notify("Task board empty.");
+            return notify(
+              tasks
+                .map((t: any) => `[${t.status}] ${t.id} — ${t.title}${t.assignee ? ` (-> ${t.assignee})` : ""}`)
+                .join("\n"),
+            );
+          }
+          case "inbox": {
+            const me = await myTeam(c);
+            if (!me) return notify("You are not in a team.");
+            const msgs = await bus.drainInbox(root, me.team, me.id);
+            if (!msgs.length) return notify("Inbox empty.");
+            return notify(`Inbox (${msgs.length}): ${formatMessages(msgs).slice(0, 600)}`);
+          }
+          case "set-role": {
+            const me = await myTeam(c);
+            if (!me) return notify("You are not in a team.");
+            const role = argv._[1] || argv.role;
+            if (!role) return notify("Usage: /team set-role <role>");
+            const res = await bus.setMemberRole(root, me.team, me.id, role);
+            if (!res.ok) return notify(`error: ${res.error}`);
+            saveSessionIdentity(c, { root, team: me.team, name: me.name, role: res.member.role });
+            return notify(`Role updated to ${res.member.role}.`);
+          }
+          case "set-name": {
+            const me = await myTeam(c);
+            if (!me) return notify("You are not in a team.");
+            const name = argv._[1] || argv.name;
+            if (!name) return notify("Usage: /team set-name <name>");
+            const jr = await bus.joinMember(root, me.team, { id: me.id, name, role: me.role, rejoin: true });
+            if (!jr.ok) return notify(`error: ${jr.error}`);
+            saveSessionIdentity(c, { root, team: me.team, name: jr.member.name, role: jr.member.role });
+            return notify(`Now known as ${jr.member.name} (${jr.member.role}).`);
+          }
+          case "config": {
+            const me = await myTeam(c);
+            if (!me) return notify("You are not in a team.");
+            const meta = await bus.loadTeam(root, me.team);
+            const members = await bus.loadMembers(root, me.team);
+            return notify(
+              `Team "${me.team}" @ ${me.dir}\nautoRespond: ${meta?.autoRespond} | interject: ${meta?.interject}\nMembers: ${Object.keys(members).length}\nYou: ${me.name} (${me.role})`,
+            );
+          }
+          case "selftest": {
+            return notify(await runSelftest());
+          }
+          default: {
+            const help = [
+              "/team create <name> [--name You] [--role R]   create a team (and optionally join it)",
+              "/team join <name> [--name You] [--role R]     join a team with your role",
+              "/team leave                                   leave your team",
+              "/team roster                                  show members + roles + status",
+              "/team tasks                                   show the task board",
+              "/team inbox                                   read pending messages",
+              "/team set-role <role> / set-name <name>       update your role/name",
+              "/team config                                  show team settings",
+              "/team selftest                                run bus self-tests",
+              "",
+              "Agents coordinate via the team tool: dm, task, report, broadcast, board_write/read,",
+              "task_create/task_list/task_done (board tasks require evidence).",
+              "Spawn a worker: PI_TEAM=<team> PI_TEAM_ROLE=<role> PI_TEAM_NAME=<name> pi",
+            ].join("\n");
+            return notify(help);
+          }
+        }
+      } catch (e: any) {
+        if (c.hasUI) c.ui.notify(`team error: ${e?.message ?? e}`, "error");
+      }
+    },
+  });
+
+  // -------------------------------------------------------------------------
+  // optional TUI rendering for team messages
+  // -------------------------------------------------------------------------
+
+  (async () => {
+    try {
+      const tui: any = await import("@earendil-works/pi-tui");
+      pi.registerMessageRenderer("team-briefing", (entry: any, { expanded }: any, theme: any) => {
+        const content = entry.message?.content;
+        const text =
+          typeof content === "string"
+            ? content
+            : Array.isArray(content)
+              ? content.map((p: any) => p?.text || "").join("\n")
+              : "";
+        const box = new tui.Box(1, 1, (t: string) => theme.bg("customMessageBg", t));
+        box.addChild(new tui.Text(theme.bold("[team]")));
+        const lines = text.split("\n");
+        const shown = expanded ? lines : lines.slice(0, 10);
+        for (const line of shown) box.addChild(new tui.Text(theme.fg("dim", line)));
+        if (shown.length < lines.length) {
+          box.addChild(new tui.Text(theme.fg("dim", `… ${lines.length - shown.length} more lines (expand)`)));
+        }
+        return box;
+      });
+    } catch {
+      /* pi-tui unavailable: messages render as plain text */
+    }
+  })();
+
+  // -------------------------------------------------------------------------
+  // spawn: open a new terminal running pi pre-joined to the team
+  // -------------------------------------------------------------------------
+
+  async function spawnWorker(
+    me: NonNullable<Awaited<ReturnType<typeof myTeam>>>,
+    p: Record<string, any>,
+    c: ExtensionContext,
+  ): Promise<string> {
+    const role = String(p.role || "").trim() || "worker";
+    const name = String(p.name || "").trim();
+    const prompt = String(p.prompt || "").trim();
+    const cwd = c.cwd || process.cwd();
+    const envPart = `PI_TEAM=${shq(me.team)} PI_TEAM_ROLE=${shq(role)} PI_TEAM_NAME=${shq(name)} PI_TEAM_DIR=${shq(me.root)}`;
+    const inner = `cd ${shq(cwd)} && ${envPart} exec pi${prompt ? ` -p ${shq(prompt)}` : ""}`;
+    const who = name || role;
+
+    if (process.platform === "darwin") {
+      try {
+        spawn(
+          "osascript",
+          ["-e", `tell application "Terminal" to do script "cd ${shq(cwd)} && ${envPart} pi"`],
+          { detached: true, stdio: "ignore" },
+        ).unref();
+        return `Spawned "${who}" (${role}) in a new Terminal window. It auto-joins team "${me.team}" on start.`;
+      } catch {
+        /* fall through to generic launchers */
+      }
+    }
+    const launchers = [
+      ...(process.env.TERMINAL ? [process.env.TERMINAL] : []),
+      "x-terminal-emulator",
+      "gnome-terminal",
+      "konsole",
+      "kitty",
+      "alacritty",
+      "wezterm",
+      "xterm",
+    ];
+    for (const t of launchers) {
+      try {
+        const child = spawn(t, ["-e", "bash", "-lc", inner], { detached: true, stdio: "ignore" });
+        child.unref();
+        return `Spawned "${who}" (${role}) in a new ${t} window. It auto-joins team "${me.team}" on start.`;
+      } catch {
+        /* try next launcher */
+      }
+    }
+    return (
+      `Could not find a terminal emulator to spawn a window. Start the worker manually in a new terminal:\n` +
+      `  cd ${shq(cwd)}\n  ${envPart} pi\n` +
+      `It auto-joins team "${me.team}" as ${name || role} on start.`
+    );
+  }
+
+  function shq(s: string): string {
+    return `'${String(s).replace(/'/g, `'\\''`)}'`;
+  }
+
+  // -------------------------------------------------------------------------
+  // selftest (no LLM involved)
+  // -------------------------------------------------------------------------
+
+  async function runSelftest(): Promise<string> {
+    const root = path.join(os.tmpdir(), `pi-team-selftest-${Date.now()}`);
+    const log: string[] = [];
+    const ok = (name: string, cond: boolean) => log.push(`${cond ? "PASS" : "FAIL"} ${name}`);
+    try {
+      await bus.createTeam(root, "acme", {});
+      ok("create team", await bus.teamExists(root, "acme"));
+      const j1 = await bus.joinMember(root, "acme", { id: "sessA", name: "Alice", role: "coordinator" });
+      const j2 = await bus.joinMember(root, "acme", { id: "sessB", name: "Bob", role: "implementer" });
+      ok("join two members", j1.ok && j2.ok);
+      const dup = await bus.joinMember(root, "acme", { id: "sessC", name: "Alice", role: "x" });
+      ok("duplicate name rejected", !dup.ok);
+      const members = await bus.loadMembers(root, "acme");
+      const tgt = bus.resolveTargets(members, "sessA", "role:implementer");
+      ok("resolve role target", tgt.ids.length === 1 && tgt.ids[0] === "sessB");
+      const sent = await bus.sendMessage(root, "acme", {
+        type: "task",
+        from: "sessA",
+        fromName: "Alice",
+        fromRole: "coordinator",
+        to: "Bob",
+        subject: "build parser",
+        body: "Please build the parser",
+        targets: tgt.ids,
+      });
+      ok("send task", sent.ok && sent.delivered === 1);
+      const inboxB = await bus.drainInbox(root, "acme", "sessB");
+      ok("Bob receives task", inboxB.length === 1 && inboxB[0].type === "task" && inboxB[0].body.includes("parser"));
+      ok("inbox drained", (await bus.pendingCount(root, "acme", "sessB")) === 0);
+      const bw = await bus.writeBoard(root, "acme", "design", "# Design\n\n- API: rest");
+      const br = await bus.readBoard(root, "acme", "design");
+      ok("board write/read", bw.ok && br.ok && br.content.includes("API: rest"));
+      const lv = await bus.leaveMember(root, "acme", "sessB");
+      ok("leave", lv.ok);
+      const after = await bus.loadMembers(root, "acme");
+      ok("member removed", !after.sessB);
+      // task board
+      await bus.joinMember(root, "acme", { id: "sessB", name: "Bob", role: "implementer" });
+      const tk = await bus.createTask(root, "acme", {
+        title: "build parser",
+        body: "Implement the parser",
+        assignee: "role:implementer",
+        criteria: ["parses JSON", "tests pass"],
+        createdBy: "sessA",
+        createdByName: "Alice",
+      });
+      ok("create task", tk.ok && tk.task.status === "queued");
+      ok("assignee notified on create", tk.notified === 1);
+      const badDone = await bus.updateTask(root, "acme", tk.task.id, { status: "done" }, { id: "sessB", name: "Bob", role: "implementer" });
+      ok("done without evidence rejected", !badDone.ok);
+      const goodDone = await bus.updateTask(
+        root, "acme", tk.task.id, { status: "done", evidence: "crates/parser.rs; 12 tests pass" },
+        { id: "sessB", name: "Bob", role: "implementer" },
+      );
+      ok("done with evidence", goodDone.ok && goodDone.task.status === "done" && goodDone.notified === 1);
+      const aliceIn = await bus.drainInbox(root, "acme", "sessA");
+      ok("creator got task_done notice", aliceIn.some((m) => m.type === "task_done"));
+      return "SELFTEST: " + log.join(" | ");
+    } catch (e: any) {
+      return "SELFTEST FAIL: " + (e?.message ?? e) + " | " + log.join(" | ");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+}
