@@ -35,7 +35,7 @@ const ACTIONS = [
   "inbox", "board_write", "board_read", "status", "whoami", "set_role",
   "spawn", "selftest",
   "task_create", "task_list", "task_show", "task_start", "task_done", "task_blocked", "task_fail", "task_assign",
-  "preset_show", "preset_save", "preset_create", "revive", "briefing", "memo", "config", "await_members",
+  "preset_show", "preset_save", "preset_create", "revive", "briefing", "memo", "config", "await_members", "kick",
 ] as const;
 
 const TEAM_IDENTITY_ENTRY = "team-identity";
@@ -692,6 +692,22 @@ export default function (pi: ExtensionAPI) {
         return `Joined team "${team}" as ${jr.member.name} (${jr.member.role}).\n${rosterLine(team, bus.rosterList(members, id))}`;
       }
 
+      case "kick": {
+        if (!me) return notInTeam;
+        if (!bus.hasRole(me.role, "coordinator")) {
+          return "error: only a coordinator can remove members (kick).";
+        }
+        const name = String(p.to || "").trim();
+        if (!name) return "error: to required (the member name to remove).";
+        const res = await bus.kickMember(root, me.team, name, {
+          byId: me.id,
+          byName: me.name,
+          reason: String(p.body || "").trim() || undefined,
+        });
+        if (!res.ok) return `error: ${res.error}`;
+        return `Removed ${res.member.name} (${res.member.role}) from team "${me.team}". Their name is free again.`;
+      }
+
       case "leave": {
         if (!me) return notInTeam;
         await bus.leaveMember(root, me.team, me.id);
@@ -1144,6 +1160,17 @@ export default function (pi: ExtensionAPI) {
             }
             return notify(`Joined "${team}" as ${jr.member.name} (${jr.member.role}).`);
           }
+          case "kick": {
+            const me = await myTeam(c);
+            if (!me) return notify("You are not in a team.");
+            if (!bus.hasRole(me.role, "coordinator")) return notify("Only a coordinator can remove members (kick).");
+            const name = argv._[1];
+            if (!name) return notify("Usage: /team kick <name> [reason...]");
+            const reason = argv._.slice(2).join(" ") || argv.body || undefined;
+            const res = await bus.kickMember(root, me.team, name, { byId: me.id, byName: me.name, reason });
+            if (!res.ok) return notify(`error: ${res.error}`);
+            return notify(`Removed ${res.member.name} (${res.member.role}) from "${me.team}". Name is free again.`);
+          }
           case "leave": {
             const me = await myTeam(c);
             if (!me) return notify("You are not in a team.");
@@ -1330,6 +1357,7 @@ export default function (pi: ExtensionAPI) {
               "/team inbox                                   read pending messages",
               "/team set-role <role> / set-name <name>       update your role/name",
               "/team prune [--hours N]                       remove dead members (0 = dead only, default 24h)",
+              "/team kick <name> [reason]                  coordinator: remove a member from the team",
               "/team memo <text>                            append to MEMORY.md in this directory (project memory)",
               "/team await <name|role:...> [--minutes N]     wait for replies (blocks until they arrive or timeout)",
               "/team briefing [--body \"...\"]               read / set the team mission (coordinator can set)",

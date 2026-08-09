@@ -364,6 +364,32 @@ const main = async () => {
     fs.rmSync(root2, { recursive: true, force: true });
   });
 
+  await t("kick member (coordinator removal)", async () => {
+    const root2 = path.join(root, "kick");
+    await bus.createTeam(root2, "k", {});
+    await bus.joinMember(root2, "k", { id: "a", name: "Alice", role: "coordinator" });
+    await bus.joinMember(root2, "k", { id: "b", name: "Bob", role: "implementer" });
+    // unknown name
+    const miss = await bus.kickMember(root2, "k", "Nobody", { byId: "a", byName: "Alice" });
+    ok("kick unknown member errors", !miss.ok);
+    // kick Bob
+    const kicked = await bus.kickMember(root2, "k", "Bob", { byId: "a", byName: "Alice", reason: "inactive" });
+    ok("kick ok", kicked.ok && kicked.member.name === "Bob" && kicked.member.role === "implementer");
+    const members = await bus.loadMembers(root2, "k");
+    ok("kicked member removed from roster", !members.b);
+    const preset = await bus.loadPreset(root2, "k");
+    ok("kicked member removed from preset", !preset.members.some((m) => m.name === "Bob"));
+    const log = await bus.readLog(root2, "k", 10);
+    ok("kick logged with reason", log.some((e) => e.event === "member_kicked" && e.reason === "inactive"));
+    // kicked member's inbox has the notice (their process would see it)
+    const bobIn = await bus.drainInbox(root2, "k", "b");
+    ok("kicked member notified", bobIn.some((m) => m.type === "system" && m.body.includes("removed from team")));
+    // kick self-guard is coordinator-side; bus-level re-kick fails
+    const again = await bus.kickMember(root2, "k", "Bob", { byId: "a", byName: "Alice" });
+    ok("re-kick errors", !again.ok);
+    fs.rmSync(root2, { recursive: true, force: true });
+  });
+
   await t("project memory (MEMORY.md)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memo-"));
     // first append seeds the header

@@ -309,6 +309,43 @@ export async function joinMember(root, team, { id, name, role, rejoin = false })
   });
 }
 
+// Coordinator action: remove a specific member by name (from the roster and
+// the preset). Frees their name; their own sessions may rejoin later (that is
+// a roster change the coordinator sees). Notifies the kicked member.
+export async function kickMember(root, team, targetName, { byId, byName, reason } = {}) {
+  const meta = await loadTeam(root, team);
+  if (!meta) return { ok: false, error: `Team "${team}" does not exist.` };
+  return withTeamLock(root, team, async () => {
+    const members = await loadMembers(root, team);
+    const hit = Object.entries(members).find(([, m]) => m && m.name === targetName);
+    if (!hit) return { ok: false, error: `no member named "${targetName}" in team "${team}"` };
+    const [sid, member] = hit;
+    delete members[sid];
+    await writeJsonAtomic(path.join(teamDir(root, team), "members.json"), { members });
+    await removePresetMember(root, team, member.name);
+    await appendTeamLog(root, team, {
+      ts: Date.now(),
+      event: "member_kicked",
+      id: sid,
+      name: member.name,
+      by: byName || byId || "coordinator",
+      reason: reason || null,
+    });
+    // Notify the kicked member's process, if it is still reachable.
+    await sendMessage(root, team, {
+      type: "system",
+      from: byId || "coordinator",
+      fromName: byName || "coordinator",
+      fromRole: "coordinator",
+      to: member.name,
+      subject: "you were removed from the team",
+      body: `You were removed from team "${team}" by ${byName || "the coordinator"}${reason ? `: ${reason}` : ""}. Your session will no longer be part of the roster.`,
+      targets: [sid],
+    }).catch(() => {});
+    return { ok: true, member: { id: sid, name: member.name, role: member.role } };
+  });
+}
+
 export async function leaveMember(root, team, id) {
   return withTeamLock(root, team, async () => {
     const members = await loadMembers(root, team);

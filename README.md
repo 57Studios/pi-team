@@ -187,7 +187,7 @@ instructions. The coordinator can extend the mission text (`team briefing
 | `team task_blocked --task_id T --body "reason"` / `task_fail` | report blockers/failure (escalates to coordinator) |
 | `team task_assign --task_id T --to name\|role:R` | reassign (creator/coordinator only) |
 | `team spawn --role implementer --name Dave [--prompt "..."]` | open a new terminal running pi, pre-joined |
-| `team create/join/leave/set_role/whoami` | team lifecycle |
+| `team create/join/leave/kick/set_role/whoami` | team lifecycle (`kick` = coordinator removes a member; the kicked member gets a notice and their name frees up) |
 
 Addresses: a member **name** (unique per team) or **`role:<role>`** (fans out
 with that role, excluding the sender). `report` defaults to `role:coordinator`.
@@ -232,6 +232,7 @@ their "typed artifacts on a DAG" without an engine:
 ```
 /team create <name> [--name You] [--role R]    create a team (and optionally join)
 /team join  <name> [--name You] [--role R]     join with your role
+/team kick <name> [reason]                    coordinator: remove a member (roster + preset)
 /team leave                                    leave your team
 /team roster                                   members + roles + statuses
 /team tasks                                    show the task board
