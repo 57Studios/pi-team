@@ -627,7 +627,12 @@ export default function (pi: ExtensionAPI) {
     lastBriefingHash = null;
     briefingDirty = false;
     const argTeam = cliTeamFlag();
-    const flag = typeof argTeam === "string" && argTeam.trim() ? argTeam : pi.getFlag("team");
+    // Windows wrappers can pass this environment variable when pi parses
+    // extension flags before the extension has registered them.
+    const envTeam = process.env.PI_TEAM_LAUNCH;
+    const flag = typeof argTeam === "string" && argTeam.trim()
+      ? argTeam
+      : (typeof envTeam === "string" && envTeam.trim() ? envTeam : pi.getFlag("team"));
     if (typeof flag === "string" && flag.trim() && !launchedFromFlag) {
       await launchFromFlag(c, flag.trim());
       return; // launchFromFlag already joined and set up the session
@@ -640,6 +645,10 @@ export default function (pi: ExtensionAPI) {
       await armAutoTimers(me);
       await armTimers(me);
       applyTitle(c, me);
+      // Pi may set its own title after session_start (notably on Windows), so
+      // re-apply ours after its startup work has completed.
+      setTimeout(() => applyTitle(c, me), 500);
+      setTimeout(() => applyTitle(c, me), 2_000);
       await seedMemo(c, me);
       await maybeSweep(me);
       await refreshWidget(c, me, true);
@@ -1832,6 +1841,30 @@ export default function (pi: ExtensionAPI) {
     const title = `${me.team} / ${who} (${role})`;
     const titleCmd = `title=${shq(title)}; printf '\\033]0;%s\\007' "$title"; `;
     const inner = `${titleCmd}cd ${shq(cwd)} && ${envPart} exec pi${prompt ? ` -p ${shq(prompt)}` : ""}`;
+
+    if (process.platform === "win32") {
+      try {
+        // Windows has no x-terminal-emulator. Use a separate PowerShell
+        // process via `start`, preserving the worker's cwd and team env.
+        const psq = (s: string) => `'${String(s).replace(/'/g, "''")}'`;
+        const extension = path.join(process.env.HOME || process.env.USERPROFILE || cwd, ".pi", "agent", "git", "github.com", "57Studios", "pi-team", "index.ts");
+        const command = [
+          `$Host.UI.RawUI.WindowTitle = ${psq(title)}`,
+          `Set-Location -LiteralPath ${psq(cwd)}`,
+          `$env:PI_TEAM = ${psq(me.team)}`,
+          `$env:PI_TEAM_ROLE = ${psq(role)}`,
+          `$env:PI_TEAM_NAME = ${psq(name)}`,
+          `$env:PI_TEAM_DIR = ${psq(me.root)}`,
+          `pi -e ${psq(extension)}${prompt ? ` -p ${psq(prompt)}` : ""}`,
+        ].join("; ");
+        const child = spawn("cmd.exe", ["/c", "start", "", "powershell.exe", "-NoExit", "-Command", command], { detached: true, stdio: "ignore" });
+        child.unref();
+        await bus.appendTeamLog(me.root, me.team, { ts: Date.now(), event: "spawn_attempt", name, role, launcher: "powershell" }).catch(() => {});
+        return `Spawned "${who}" (${role}) in a new PowerShell window. It auto-joins team "${me.team}".`;
+      } catch {
+        /* fall through to generic launchers */
+      }
+    }
 
     if (process.platform === "darwin") {
       try {

@@ -38,13 +38,11 @@ export function teamsRoot(env = process.env) {
   return v || TEAMS_ROOT_DEFAULT;
 }
 
-// Resolve a team name to its exact on-disk name (case-insensitive fuzzy
-// fallback), so `--team zilla` / `team join zilla` find "Zilla".
+// Resolve a team name to its exact on-disk name (case-insensitive lookup),
+// so `--team zilla` / `team join zilla` find "Zilla" on Windows too.
 export async function resolveTeamName(root, name) {
   const exact = String(name || "").trim();
   if (!exact) return null;
-  if (await pathExists(teamDir(root, exact))) return exact;
-  // root IS the teams directory (teamDir(root, team) === root/team).
   let entries = [];
   try {
     entries = await fs.promises.readdir(root);
