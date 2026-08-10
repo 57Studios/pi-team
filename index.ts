@@ -198,7 +198,7 @@ export default function (pi: ExtensionAPI) {
       lines.push("No reviewers on this team — the coordinator reviews completed work.");
     }
     lines.push(
-      "Project memory: read agent-team/MEMORY.md in the working directory when you start work; record decisions, gotchas, and next steps with team memo.",
+      "Project memory: agent-team/MEMORY.md in the working directory is AUTO-INJECTED into your context (re-injected when it changes) — read the full file with: read agent-team/MEMORY.md when you need deep context. Record decisions, gotchas, and next steps with team memo.",
     );
     // Team protocol (role-aware, derived from the roster).
     lines.push("Protocol:");
@@ -678,11 +678,23 @@ export default function (pi: ExtensionAPI) {
     const members = await bus.loadMembers(me.root, me.team);
     const brief = await bus.loadBrief(me.root, me.team);
     const briefingBlock = `[team-context] ${buildBriefing(me, members, brief)}`;
+    // Project memory (agent-team/MEMORY.md) rides along: auto-injected like
+    // AGENTS.md would be, but capped and only re-injected when it changes.
+    const memo = c.cwd ? await bus.memoRead(c.cwd) : null;
+    const MEMO_MAX = 20_000;
+    const memoBlock = memo
+      ? `[project memory — agent-team/MEMORY.md]\n${
+          memo.length > MEMO_MAX
+            ? memo.slice(-MEMO_MAX) + `\n… (${memo.length} chars total; read the full file with: read agent-team/MEMORY.md)`
+            : memo
+        }`
+      : "";
+    const memoHash = memo ? hashStr(memo) : "";
     // Hash on a liveness-stripped copy: idle/offline flapping must NOT
     // re-inject the briefing every prompt (that was an empty-looking
     // "[team]" box on every prompt). Only stable changes (role, mission,
-    // roster membership) trigger re-injection.
-    const briefingHash = hashStr(briefingBlock.replace(/, offline\)/g, ")"));
+    // roster membership, project memory) trigger re-injection.
+    const briefingHash = hashStr(briefingBlock.replace(/, offline\)/g, ")") + "|memo:" + memoHash);
     // Inject only when needed: first run of a session, after compaction, or
     // when role/mission/roster changed. Steady state costs zero tokens and
     // the briefing still lives in context (it was already injected). Compaction
@@ -695,6 +707,7 @@ export default function (pi: ExtensionAPI) {
       lastBriefingHash = briefingHash;
       briefingDirty = false;
       parts.push(briefingBlock);
+      if (memoBlock) parts.push(memoBlock);
     }
     if (!parts.length) return;
     const content = parts.join("\n\n");
