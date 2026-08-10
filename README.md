@@ -14,6 +14,17 @@ Then run `/reload` in pi and verify with `/team selftest`. No npm install
 needed (pi provides `typebox` and `pi-tui`). Alternative: `pi install
 git:github.com/57Studios/pi-team`.
 
+### Windows
+
+Install [pi](https://pi.dev) first, then install this extension from PowerShell:
+
+```powershell
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+pi install git:github.com/57Studios/pi-team
+```
+
+Restart pi (or run `/reload`) after installation.
+
 ## Quick start
 
 ```bash
