@@ -675,6 +675,30 @@ const main = async () => {
     fs.rmSync(root2, { recursive: true, force: true });
   });
 
+  await t("team definition export/import (portable teams)", async () => {
+    const root2 = path.join(root, "exp");
+    const out = path.join(root, "exp-out");
+    await bus.createTeam(root2, "P", {});
+    await bus.savePreset(root2, "P", [{ name: "Zed", role: "Hub" }, { name: "Mint", role: "Math" }]);
+    await bus.saveBrief(root2, "P", "# mission\nrun the cycles");
+    await bus.setTeamSetting(root2, "P", { autoRespond: true, autoTimers: [{ name: "Zed", minutes: 15, tag: "z", body: "cycle" }] });
+    const ex = await bus.exportTeam(root2, "P", path.join(out, "P.json"));
+    ok("export ok", ex.ok && ex.members === 2 && ex.file === path.join(out, "P.json"));
+    // fresh root: import recreates everything
+    const fresh = path.join(root, "exp-fresh");
+    await fs.promises.mkdir(fresh, { recursive: true });
+    const im = await bus.importTeam(fresh, path.join(out, "P.json"));
+    ok("import ok", im.ok && im.name === "P" && im.members === 2);
+    ok("preset restored", (await bus.loadPreset(fresh, "P")).members.length === 2);
+    ok("briefing restored", (await bus.loadBrief(fresh, "P")).includes("run the cycles"));
+    const meta = await bus.loadTeam(fresh, "P");
+    ok("autoTimers restored", (meta.autoTimers || []).some((t) => t.name === "Zed" && t.minutes === 15));
+    ok("autoRespond restored", meta.autoRespond === true);
+    await fs.promises.rm(out, { recursive: true, force: true });
+    await fs.promises.rm(fresh, { recursive: true, force: true });
+    fs.rmSync(root2, { recursive: true, force: true });
+  });
+
   await t("project memory (MEMORY.md)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memo-"));
     // first append seeds the header

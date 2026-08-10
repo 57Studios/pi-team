@@ -113,6 +113,16 @@ test/      unit tests (node --experimental-strip-types test/bus.test.mjs)
 install.sh one-command installer
 ```
 
+## Portable teams (other machines)
+
+Team definitions live in the repo's `teams/` dir — a fresh clone has them all:
+
+```bash
+/team export Zilla          # write this team's definition (preset, briefing, settings, timers) to teams/Zilla.json
+/team import Zilla          # recreate a team from teams/Zilla.json
+pi --team zilla             # auto-imports from teams/ if the local team doesn't exist yet
+```
+
 ## Tests
 
 ```bash

@@ -35,7 +35,7 @@ const ACTIONS = [
   "inbox", "board_write", "board_read", "status", "whoami", "set_role",
   "spawn", "selftest",
   "task_create", "task_list", "task_show", "task_start", "task_done", "task_blocked", "task_fail", "task_assign",
-  "preset_show", "preset_save", "preset_create", "revive", "briefing", "memo", "config", "await_members", "kick", "checkin", "later", "timers", "search", "clear",
+  "preset_show", "preset_save", "preset_create", "revive", "briefing", "memo", "config", "await_members", "kick", "checkin", "later", "timers", "search", "clear", "export", "import",
 ] as const;
 
 const TEAM_IDENTITY_ENTRY = "team-identity";
@@ -554,6 +554,18 @@ export default function (pi: ExtensionAPI) {
       preset = null;
     }
     if (!preset?.members?.length) {
+      // Fallback: materialize the team from the versioned teams/ dir in the
+      // repo (fresh clone on another machine -> pi --team zilla just works).
+      const def = findTeamDef(resolved);
+      if (def) {
+        const imp = await bus.importTeam(root, def).catch(() => null);
+        // The def may be capitalized differently than the CLI arg ("zilla" ->
+        // "Zilla"); re-resolve the ACTUAL team name after importing.
+        if (imp?.ok) resolved = (await bus.resolveTeamName(root, team)) || imp.name;
+        preset = await bus.loadPreset(root, resolved).catch(() => null);
+      }
+    }
+    if (!preset?.members?.length) {
       try {
         c.ui.notify(`[team] No preset found for team "${team}". Create it first: /team preset create Optimus=coordinator, reviewer Bee=implementer ...`, "error");
       } catch { /* ignore */ }
@@ -774,6 +786,27 @@ export default function (pi: ExtensionAPI) {
         ? ` Offline (DM queued, not counted): ${offline.join(", ")} — team revive to wake them.`
         : "";
     return `Checkin sent to ${targetLabel} (${allNames.length}; wake: YES). Non-blocking: end this turn — each reply auto-wakes me with progress and I summarize when all have replied. Do NOT sleep or poll the inbox.${warn}`;
+  }
+
+  // Locate a versioned team definition: teams/<Name>.json next to the
+  // extension, in the standard install dir, or in the cwd.
+  function findTeamDef(name: string): string | null {
+    const want = name.toLowerCase();
+    const candidates = [];
+    try {
+      const here = path.dirname(new URL(import.meta.url).pathname);
+      candidates.push(path.join(here, "teams"), path.join(here, "..", "pi-team", "teams"));
+    } catch { /* jiti may rewrite import.meta.url */ }
+    candidates.push(path.join(process.env.HOME || "/tmp", ".pi", "agent", "extensions", "pi-team", "teams"));
+    if (process.cwd()) candidates.push(path.join(process.cwd(), "teams"));
+    for (const dir of candidates) {
+      try {
+        const entries = fs.readdirSync(dir);
+        const hit = entries.find((e) => e.toLowerCase() === `${want}.json` || e.toLowerCase() === want);
+        if (hit) return path.join(dir, hit.endsWith(".json") ? hit : `${hit}.json`);
+      } catch { /* next candidate */ }
+    }
+    return null;
   }
 
   // Per-project task board: <cwd>/agent-team when present, else team board.
@@ -1223,6 +1256,25 @@ export default function (pi: ExtensionAPI) {
         return `Board cleared: archived ${res.archived} task${res.archived === 1 ? "" : "s"} (${res.done} done) to ${res.archive}${res.topicsCleared ? `; cleared ${res.topicsCleared} board topic(s)` : ""}. ${store.kind === "project" ? `Project board (${store.dir})` : `Team "${me.team}"`} is ready for a new project.`;
       }
 
+      case "export": {
+        if (!me) return notInTeam;
+        const name = String(p.team || me.team || "").trim();
+        if (!name) return "error: team name required (team).";
+        const res = await bus.exportTeam(root, name, p.file || undefined);
+        if (!res.ok) return `error: ${res.error}`;
+        return `Exported team "${name}" (${res.members} preset members) to ${res.file} — commit it to share with other machines.`;
+      }
+
+      case "import": {
+        const name = String(p.team || "").trim();
+        if (!name) return "error: team name required (team).";
+        const def = p.file || findTeamDef(name);
+        if (!def) return `error: no team definition for "${name}" in the repo teams/ dir.`;
+        const res = await bus.importTeam(root, def);
+        if (!res.ok) return `error: ${res.error}`;
+        return `Imported team "${res.name}" (${res.members} preset members) from ${def}. Join with: team join ${res.name} --name <you> --role <role>, or relaunch: pi --team ${res.name}.`;
+      }
+
       case "checkin": {
         if (!me) return notInTeam;
         return await checkinMembers(me, { to: String(p.to || ""), body: String(p.body || "") });
@@ -1390,6 +1442,7 @@ export default function (pi: ExtensionAPI) {
       board: Type.Optional(Type.Boolean({ description: "For clear (coordinator): also wipe board topics." })),
       auto_timers: Type.Optional(Type.String({ description: "For config (coordinator): standing cadence timers 'Name:minutes:body;Name2:30:body2' — auto-armed at session start, re-armed after each fire." })),
       query: Type.Optional(Type.String({ description: "For search: the web query (SearXNG, local)." })),
+      file: Type.Optional(Type.String({ description: "For export/import: path to the team definition file." })),
       count: Type.Optional(Type.Number({ description: "For search: max results (1-10, default 6)." })),
       categories: Type.Optional(Type.String({ description: "For search: SearXNG categories, e.g. 'news,general'." })),
       timeout_minutes: Type.Optional(Type.Number({ description: "For await_members: max minutes to wait (1-30, default 3)." })),
@@ -1551,6 +1604,23 @@ export default function (pi: ExtensionAPI) {
             const res = await bus.clearBoard(root, me.team, { clearTopics: argv.all === "true" || argv.board === "true" }, store.dir);
             if (!res.ok) return notify(`error: ${res.error}`);
             return notify(`Board cleared: archived ${res.archived} task${res.archived === 1 ? "" : "s"} (${res.done} done) to ${res.archive}${res.topicsCleared ? `; cleared ${res.topicsCleared} board topic(s)` : ""}. ${store.kind === "project" ? `Project board (${store.dir})` : `Team "${me.team}"`} is ready for a new project.`);
+          }
+          case "export": {
+            const me = await myTeam(c);
+            if (!me) return notify("You are not in a team.");
+            const name = argv._[1] || me.team;
+            const res = await bus.exportTeam(root, name, argv.file || undefined);
+            if (!res.ok) return notify(`error: ${res.error}`);
+            return notify(`Exported team "${name}" (${res.members} preset members) to ${res.file}. Commit it to share.`);
+          }
+          case "import": {
+            const name = argv._[1];
+            if (!name) return notify("Usage: /team import <TeamName> [--file <path>]");
+            const def = argv.file || findTeamDef(name);
+            if (!def) return notify(`error: no team definition for "${name}" in the repo teams/ dir.`);
+            const res = await bus.importTeam(root, def);
+            if (!res.ok) return notify(`error: ${res.error}`);
+            return notify(`Imported team "${res.name}" (${res.members} preset members) from ${def}.`);
           }
           case "checkin": {
             const me = await myTeam(c);
@@ -1774,6 +1844,8 @@ export default function (pi: ExtensionAPI) {
               "/team memo <text>                            append to MEMORY.md in this directory (project memory)",
               "/team later <min> [--body Q] [--at HH:MM]   set a self-ping timer (harness wakes you; --cancel <id> to remove)",
               "/team timers                               list your timers",
+              "/team export [name]                        write this team's definition to teams/<name>.json (commit to share)",
+              "/team import <name> [--file <path>]        recreate a team from the repo's teams/ dir",
               "/team clear [--all]                       coordinator: wipe the board (tasks archived first) for a new project",
               "/team checkin [names...] [--body Q]       non-blocking status check (replies auto-wake you)",
               "/team await <names...> [--minutes N]       BLOCKING: wait for ALL named members to reply (one call, all at once)",

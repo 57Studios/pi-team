@@ -1625,6 +1625,67 @@ export async function sweepTeam(root, team) {
 // used by `team revive` / `/team revive` to spawn the whole team back.
 // ---------------------------------------------------------------------------
 
+// ---- team definition files (versioned in the repo for portability) --------
+// teams/<Team>.json carries everything needed to recreate a team on another
+// machine: preset members, briefing, settings (autoRespond/interject/
+// searchUrl) and standing autoTimers.
+
+export function teamDefPath(extensionRoot, team) {
+  return path.join(extensionRoot || ".", "teams", `${team}.json`);
+}
+
+export async function exportTeam(root, team, outDir) {
+  const meta = await loadTeam(root, team);
+  if (!meta) return { ok: false, error: `Team "${team}" does not exist.` };
+  const preset = await loadPreset(root, team);
+  const briefing = await loadBrief(root, team).catch(() => null);
+  const def = {
+    name: team,
+    version: 1,
+    preset: (preset?.members || []).map((m) => ({ name: m.name, role: m.role })),
+    briefing: briefing || null,
+    settings: {
+      autoRespond: meta.autoRespond,
+      interject: meta.interject,
+      searchUrl: meta.searchUrl || null,
+      autoTimers: meta.autoTimers || [],
+    },
+  };
+  const dir = outDir || teamDefPath(process.cwd());
+  await fsp.mkdir(path.dirname(dir), { recursive: true });
+  await writeJsonAtomic(dir, def);
+  return { ok: true, file: dir, members: def.preset.length };
+}
+
+export async function importTeam(root, file) {
+  let def;
+  try {
+    def = JSON.parse(await fsp.readFile(file, "utf8"));
+  } catch (e) {
+    return { ok: false, error: `cannot read team definition "${file}": ${e?.message || e}` };
+  }
+  const name = String(def.name || "").trim();
+  if (!name) return { ok: false, error: "team definition missing a name" };
+  if (!(await teamExists(root, name))) {
+    await createTeam(root, name, {});
+  }
+  const settings = def.settings || {};
+  await setTeamSetting(root, name, {
+    autoRespond: settings.autoRespond !== false,
+    interject: settings.interject !== false,
+    searchUrl: settings.searchUrl || undefined,
+    autoTimers: Array.isArray(settings.autoTimers) ? settings.autoTimers : undefined,
+  }).catch(() => {});
+  if (Array.isArray(def.preset) && def.preset.length) {
+    await savePreset(root, name, def.preset);
+  }
+  if (typeof def.briefing === "string" && def.briefing.trim()) {
+    await saveBrief(root, name, def.briefing);
+  }
+  await appendTeamLog(root, name, { ts: Date.now(), event: "team_imported", from: file, preset: (def.preset || []).length });
+  return { ok: true, name, members: (def.preset || []).length };
+}
+
 export async function loadPreset(root, team) {
   const data = await readJson(path.join(teamDir(root, team), "preset.json"), null);
   return data && Array.isArray(data.members) ? data : null;
