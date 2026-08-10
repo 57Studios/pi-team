@@ -35,7 +35,7 @@ const ACTIONS = [
   "inbox", "board_write", "board_read", "status", "whoami", "set_role",
   "spawn", "selftest",
   "task_create", "task_list", "task_show", "task_start", "task_done", "task_blocked", "task_fail", "task_assign",
-  "preset_show", "preset_save", "preset_create", "revive", "briefing", "memo", "config", "await_members", "kick", "checkin", "later", "timers", "search", "clear",
+  "preset_show", "preset_save", "preset_create", "revive", "briefing", "memo", "config", "await_members", "kick", "checkin", "later", "timers", "search", "clear", "export", "import",
 ] as const;
 
 const TEAM_IDENTITY_ENTRY = "team-identity";
@@ -198,7 +198,7 @@ export default function (pi: ExtensionAPI) {
       lines.push("No reviewers on this team — the coordinator reviews completed work.");
     }
     lines.push(
-      "Project memory: read agent-team/MEMORY.md in the working directory when you start work; record decisions, gotchas, and next steps with team memo.",
+      "Project memory: agent-team/MEMORY.md in the working directory is AUTO-INJECTED into your context (re-injected when it changes) — read the full file with: read agent-team/MEMORY.md when you need deep context. Record decisions, gotchas, and next steps with team memo.",
     );
     // Team protocol (role-aware, derived from the roster).
     lines.push("Protocol:");
@@ -218,6 +218,7 @@ export default function (pi: ExtensionAPI) {
         "- To be woken by the harness later (e.g. check back in 30 min), set a timer: team later --minutes 30 --body \"...\" (or --at HH:MM). The harness pings you with a turn when it fires; timers survive restarts.",
         "- Web search is built in: team search \"query\" (SearXNG on localhost — no API key; use --categories news for news). Scout/research work: search first, then verify the top hits before citing.",
         "- Cross-team comm is LEAD-TO-LEAD: only coordinators (Hub/Boss/Lead) may DM another team, and only to that team's coordinator — team dm to:'Zilla/Zed' or to:'Zilla/role:coordinator'. Non-leads asking for cross-team coordination should ask their own coordinator to relay. dm/report only; boards and tasks stay per-team.",
+        "- Task boards are PER-PROJECT: when you work inside a repo that has an agent-team/ directory, task_create/task_list/board_write/board_read/clear operate on THAT project's board (<repo>/agent-team/tasks.json + board/). Otherwise they use the team board. The team audit log stays team-level.",
       );
       if (researchers.length) {
         lines.push(
@@ -506,9 +507,10 @@ export default function (pi: ExtensionAPI) {
     if (!force && now - lastWidgetAt < 15_000) return;
     lastWidgetAt = now;
     try {
+      const store = c?.cwd ? bus.resolveTaskStore(me.root, me.team, c.cwd) : null;
       const [members, tasks, pending] = await Promise.all([
         bus.loadMembers(me.root, me.team),
-        bus.loadTasks(me.root, me.team),
+        bus.loadTasks(me.root, me.team, store?.dir),
         bus.pendingCount(me.root, me.team, me.id),
       ]);
       const done = tasks.filter((t: any) => t.status === "done").length;
@@ -550,6 +552,18 @@ export default function (pi: ExtensionAPI) {
       preset = await bus.loadPreset(root, resolved);
     } catch {
       preset = null;
+    }
+    if (!preset?.members?.length) {
+      // Fallback: materialize the team from the versioned teams/ dir in the
+      // repo (fresh clone on another machine -> pi --team zilla just works).
+      const def = findTeamDef(resolved);
+      if (def) {
+        const imp = await bus.importTeam(root, def).catch(() => null);
+        // The def may be capitalized differently than the CLI arg ("zilla" ->
+        // "Zilla"); re-resolve the ACTUAL team name after importing.
+        if (imp?.ok) resolved = (await bus.resolveTeamName(root, team)) || imp.name;
+        preset = await bus.loadPreset(root, resolved).catch(() => null);
+      }
     }
     if (!preset?.members?.length) {
       try {
@@ -685,11 +699,23 @@ export default function (pi: ExtensionAPI) {
     const members = await bus.loadMembers(me.root, me.team);
     const brief = await bus.loadBrief(me.root, me.team);
     const briefingBlock = `[team-context] ${buildBriefing(me, members, brief)}`;
+    // Project memory (agent-team/MEMORY.md) rides along: auto-injected like
+    // AGENTS.md would be, but capped and only re-injected when it changes.
+    const memo = c.cwd ? await bus.memoRead(c.cwd) : null;
+    const MEMO_MAX = 20_000;
+    const memoBlock = memo
+      ? `[project memory — agent-team/MEMORY.md]\n${
+          memo.length > MEMO_MAX
+            ? memo.slice(-MEMO_MAX) + `\n… (${memo.length} chars total; read the full file with: read agent-team/MEMORY.md)`
+            : memo
+        }`
+      : "";
+    const memoHash = memo ? hashStr(memo) : "";
     // Hash on a liveness-stripped copy: idle/offline flapping must NOT
     // re-inject the briefing every prompt (that was an empty-looking
     // "[team]" box on every prompt). Only stable changes (role, mission,
-    // roster membership) trigger re-injection.
-    const briefingHash = hashStr(briefingBlock.replace(/, offline\)/g, ")"));
+    // roster membership, project memory) trigger re-injection.
+    const briefingHash = hashStr(briefingBlock.replace(/, offline\)/g, ")") + "|memo:" + memoHash);
     // Inject only when needed: first run of a session, after compaction, or
     // when role/mission/roster changed. Steady state costs zero tokens and
     // the briefing still lives in context (it was already injected). Compaction
@@ -702,6 +728,7 @@ export default function (pi: ExtensionAPI) {
       lastBriefingHash = briefingHash;
       briefingDirty = false;
       parts.push(briefingBlock);
+      if (memoBlock) parts.push(memoBlock);
     }
     if (!parts.length) return;
     const content = parts.join("\n\n");
@@ -770,6 +797,32 @@ export default function (pi: ExtensionAPI) {
     return `Checkin sent to ${targetLabel} (${allNames.length}; wake: YES). Non-blocking: end this turn — each reply auto-wakes me with progress and I summarize when all have replied. Do NOT sleep or poll the inbox.${warn}`;
   }
 
+  // Locate a versioned team definition: teams/<Name>.json next to the
+  // extension, in the standard install dir, or in the cwd.
+  function findTeamDef(name: string): string | null {
+    const want = name.toLowerCase();
+    const candidates = [];
+    try {
+      const here = path.dirname(new URL(import.meta.url).pathname);
+      candidates.push(path.join(here, "teams"), path.join(here, "..", "pi-team", "teams"));
+    } catch { /* jiti may rewrite import.meta.url */ }
+    candidates.push(path.join(process.env.HOME || "/tmp", ".pi", "agent", "extensions", "pi-team", "teams"));
+    if (process.cwd()) candidates.push(path.join(process.cwd(), "teams"));
+    for (const dir of candidates) {
+      try {
+        const entries = fs.readdirSync(dir);
+        const hit = entries.find((e) => e.toLowerCase() === `${want}.json` || e.toLowerCase() === want);
+        if (hit) return path.join(dir, hit.endsWith(".json") ? hit : `${hit}.json`);
+      } catch { /* next candidate */ }
+    }
+    return null;
+  }
+
+  // Per-project task board: <cwd>/agent-team when present, else team board.
+  async function taskStore(me: NonNullable<Awaited<ReturnType<typeof myTeam>>>, c: ExtensionContext) {
+    return bus.resolveTaskStore(me.root, me.team, c?.cwd);
+  }
+
   function checkinProgressLine(rec: any): string {
     if (!rec || !rec.targets?.length) return "";
     const missing = rec.targets.filter((n: string) => !rec.replied.includes(n));
@@ -817,12 +870,14 @@ export default function (pi: ExtensionAPI) {
     const root = p.dir?.trim() || bus.teamsRoot(process.env);
     const tid = String(p.task_id || "").trim();
     if (!tid) return "error: task_id required (task_id).";
+    const store = await taskStore(me, c);
     const res = await bus.updateTask(
       root,
       me.team,
       tid,
       { status: to, reason: p.body, evidence: p.evidence, depOverride: p.dep_override, confidence: p.confidence },
       { id: me.id, name: me.name, role: me.role },
+      store.dir,
     );
     if (!res.ok) return `error: ${res.error}`;
     let out = `Task ${tid} -> ${to}.`;
@@ -1018,16 +1073,18 @@ export default function (pi: ExtensionAPI) {
         if (!me) return notInTeam;
         const topic = String(p.topic || "").trim();
         if (!topic) return "error: topic required for board_write.";
-        const res = await bus.writeBoard(root, me.team, topic, p.body);
-        return res.ok ? `Board "${topic}" updated.` : `error: ${res.error}`;
+        const store = await taskStore(me, c);
+        const res = await bus.writeBoard(root, me.team, topic, p.body, store.dir);
+        return res.ok ? `Board "${topic}" updated${store.kind === "project" ? ` (project board ${store.dir})` : ""}.` : `error: ${res.error}`;
       }
 
       case "board_read": {
         if (!me) return notInTeam;
-        const res = await bus.readBoard(root, me.team, p.topic);
+        const store = await taskStore(me, c);
+        const res = await bus.readBoard(root, me.team, p.topic, store.dir);
         if (!res.ok) return `error: ${res.error}`;
         if (p.topic) return `# ${res.topic}\n\n${res.content}`;
-        return `Board topics: ${res.topics.length ? res.topics.join(", ") : "(empty)"}`;
+        return `Board topics: ${res.topics.length ? res.topics.join(", ") : "(empty)"}${store.kind === "project" ? ` (project board ${store.dir})` : ""}`;
       }
 
       // ---- task board (structured tasks; done requires evidence) ----
@@ -1041,6 +1098,7 @@ export default function (pi: ExtensionAPI) {
           : String(p.criteria || "").split(/\n|;/).map((s) => s.trim()).filter(Boolean);
         const dependsOn = Array.isArray(p.depends_on) ? p.depends_on.map(String) : [];
         const assignee = p.to ? String(p.to).trim() : null;
+        const store = await taskStore(me, c);
         const res = await bus.createTask(root, me.team, {
           title,
           body: p.body,
@@ -1052,7 +1110,7 @@ export default function (pi: ExtensionAPI) {
           reviewOf: p.review_of,
           createdBy: me.id,
           createdByName: me.name,
-        });
+        }, store.dir);
         if (!res.ok) return `error: ${res.error}`;
         let out = `Created task ${res.task.id} [${res.task.status}]${res.task.kind === "review" ? " (review)" : ""}: ${title}${assignee ? ` -> ${assignee}` : ""}.`;
         if (res.notified) out += ` Notified ${res.notified} assignee(s).`;
@@ -1063,8 +1121,9 @@ export default function (pi: ExtensionAPI) {
 
       case "task_list": {
         if (!me) return notInTeam;
-        const tasks = await bus.loadTasks(root, me.team);
-        if (!tasks.length) return "Task board empty. Create tasks with team task_create.";
+        const store = await taskStore(me, c);
+        const tasks = await bus.loadTasks(root, me.team, store.dir);
+        if (!tasks.length) return `Task board empty${store.kind === "project" ? ` (project ${store.dir})` : ""}. Create tasks with team task_create.`;
         return tasks
           .map((t: any) => `[${t.status}] ${t.id} — ${t.title}${t.assignee ? ` (-> ${t.assignee})` : ""}`)
           .join("\n");
@@ -1074,7 +1133,8 @@ export default function (pi: ExtensionAPI) {
         if (!me) return notInTeam;
         const tid = String(p.task_id || "").trim();
         if (!tid) return "error: task_id required.";
-        const tasks = await bus.loadTasks(root, me.team);
+        const store = await taskStore(me, c);
+        const tasks = await bus.loadTasks(root, me.team, store.dir);
         const t = tasks.find((x: any) => x.id === tid);
         if (!t) return `error: unknown task "${tid}"`;
         return formatTask(t, tasks);
@@ -1094,12 +1154,14 @@ export default function (pi: ExtensionAPI) {
         const tid = String(p.task_id || "").trim();
         if (!tid) return "error: task_id required.";
         if (!p.to) return "error: to required (new assignee name or role:<role>).";
+        const store = await taskStore(me, c);
         const res = await bus.updateTask(
           root,
           me.team,
           tid,
           { assignee: String(p.to).trim() },
           { id: me.id, name: me.name, role: me.role },
+          store.dir,
         );
         if (!res.ok) return `error: ${res.error}`;
         return `Task ${tid} reassigned to ${res.task.assignee}.`;
@@ -1197,9 +1259,29 @@ export default function (pi: ExtensionAPI) {
       case "clear": {
         if (!me) return notInTeam;
         if (!bus.hasRole(me.role, "coordinator")) return "error: only a coordinator can clear the team board.";
-        const res = await bus.clearBoard(root, me.team, { clearTopics: p.board === true || p.all === true });
+        const store = await taskStore(me, c);
+        const res = await bus.clearBoard(root, me.team, { clearTopics: p.board === true || p.all === true }, store.dir);
         if (!res.ok) return `error: ${res.error}`;
-        return `Board cleared: archived ${res.archived} task${res.archived === 1 ? "" : "s"} (${res.done} done) to ${res.archive}${res.topicsCleared ? `; cleared ${res.topicsCleared} board topic(s)` : ""}. Team "${me.team}" is ready for a new project.`;
+        return `Board cleared: archived ${res.archived} task${res.archived === 1 ? "" : "s"} (${res.done} done) to ${res.archive}${res.topicsCleared ? `; cleared ${res.topicsCleared} board topic(s)` : ""}. ${store.kind === "project" ? `Project board (${store.dir})` : `Team "${me.team}"`} is ready for a new project.`;
+      }
+
+      case "export": {
+        if (!me) return notInTeam;
+        const name = String(p.team || me.team || "").trim();
+        if (!name) return "error: team name required (team).";
+        const res = await bus.exportTeam(root, name, p.file || undefined);
+        if (!res.ok) return `error: ${res.error}`;
+        return `Exported team "${name}" (${res.members} preset members) to ${res.file} — commit it to share with other machines.`;
+      }
+
+      case "import": {
+        const name = String(p.team || "").trim();
+        if (!name) return "error: team name required (team).";
+        const def = p.file || findTeamDef(name);
+        if (!def) return `error: no team definition for "${name}" in the repo teams/ dir.`;
+        const res = await bus.importTeam(root, def);
+        if (!res.ok) return `error: ${res.error}`;
+        return `Imported team "${res.name}" (${res.members} preset members) from ${def}. Join with: team join ${res.name} --name <you> --role <role>, or relaunch: pi --team ${res.name}.`;
       }
 
       case "checkin": {
@@ -1369,6 +1451,7 @@ export default function (pi: ExtensionAPI) {
       board: Type.Optional(Type.Boolean({ description: "For clear (coordinator): also wipe board topics." })),
       auto_timers: Type.Optional(Type.String({ description: "For config (coordinator): standing cadence timers 'Name:minutes:body;Name2:30:body2' — auto-armed at session start, re-armed after each fire." })),
       query: Type.Optional(Type.String({ description: "For search: the web query (SearXNG, local)." })),
+      file: Type.Optional(Type.String({ description: "For export/import: path to the team definition file." })),
       count: Type.Optional(Type.Number({ description: "For search: max results (1-10, default 6)." })),
       categories: Type.Optional(Type.String({ description: "For search: SearXNG categories, e.g. 'news,general'." })),
       timeout_minutes: Type.Optional(Type.Number({ description: "For await_members: max minutes to wait (1-30, default 3)." })),
@@ -1526,9 +1609,27 @@ export default function (pi: ExtensionAPI) {
             const me = await myTeam(c);
             if (!me) return notify("You are not in a team.");
             if (!bus.hasRole(me.role, "coordinator")) return notify("Only a coordinator can clear the team board.");
-            const res = await bus.clearBoard(root, me.team, { clearTopics: argv.all === "true" || argv.board === "true" });
+            const store = await taskStore(me, c);
+            const res = await bus.clearBoard(root, me.team, { clearTopics: argv.all === "true" || argv.board === "true" }, store.dir);
             if (!res.ok) return notify(`error: ${res.error}`);
-            return notify(`Board cleared: archived ${res.archived} task${res.archived === 1 ? "" : "s"} (${res.done} done) to ${res.archive}${res.topicsCleared ? `; cleared ${res.topicsCleared} board topic(s)` : ""}. Team "${me.team}" is ready for a new project.`);
+            return notify(`Board cleared: archived ${res.archived} task${res.archived === 1 ? "" : "s"} (${res.done} done) to ${res.archive}${res.topicsCleared ? `; cleared ${res.topicsCleared} board topic(s)` : ""}. ${store.kind === "project" ? `Project board (${store.dir})` : `Team "${me.team}"`} is ready for a new project.`);
+          }
+          case "export": {
+            const me = await myTeam(c);
+            if (!me) return notify("You are not in a team.");
+            const name = argv._[1] || me.team;
+            const res = await bus.exportTeam(root, name, argv.file || undefined);
+            if (!res.ok) return notify(`error: ${res.error}`);
+            return notify(`Exported team "${name}" (${res.members} preset members) to ${res.file}. Commit it to share.`);
+          }
+          case "import": {
+            const name = argv._[1];
+            if (!name) return notify("Usage: /team import <TeamName> [--file <path>]");
+            const def = argv.file || findTeamDef(name);
+            if (!def) return notify(`error: no team definition for "${name}" in the repo teams/ dir.`);
+            const res = await bus.importTeam(root, def);
+            if (!res.ok) return notify(`error: ${res.error}`);
+            return notify(`Imported team "${res.name}" (${res.members} preset members) from ${def}.`);
           }
           case "checkin": {
             const me = await myTeam(c);
@@ -1556,8 +1657,9 @@ export default function (pi: ExtensionAPI) {
           case "tasks": {
             const me = await myTeam(c);
             if (!me) return notify("You are not in a team.");
-            const tasks = await bus.loadTasks(root, me.team);
-            if (!tasks.length) return notify("Task board empty.");
+            const store = await taskStore(me, c);
+            const tasks = await bus.loadTasks(root, me.team, store.dir);
+            if (!tasks.length) return notify(`Task board empty${store.kind === "project" ? ` (project ${store.dir})` : ""}.`);
             return notify(
               tasks
                 .map((t: any) => `[${t.status}] ${t.id} — ${t.title}${t.kind === "review" ? " (review)" : ""}${t.assignee ? ` (-> ${t.assignee})` : ""}`)
@@ -1751,6 +1853,8 @@ export default function (pi: ExtensionAPI) {
               "/team memo <text>                            append to MEMORY.md in this directory (project memory)",
               "/team later <min> [--body Q] [--at HH:MM]   set a self-ping timer (harness wakes you; --cancel <id> to remove)",
               "/team timers                               list your timers",
+              "/team export [name]                        write this team's definition to teams/<name>.json (commit to share)",
+              "/team import <name> [--file <path>]        recreate a team from the repo's teams/ dir",
               "/team clear [--all]                       coordinator: wipe the board (tasks archived first) for a new project",
               "/team checkin [names...] [--body Q]       non-blocking status check (replies auto-wake you)",
               "/team await <names...> [--minutes N]       BLOCKING: wait for ALL named members to reply (one call, all at once)",

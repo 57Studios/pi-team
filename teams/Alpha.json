@@ -1,0 +1,33 @@
+{
+  "name": "Alpha",
+  "version": 1,
+  "preset": [
+    {
+      "name": "Optimus",
+      "role": "coordinator, reviewer"
+    },
+    {
+      "name": "Bee",
+      "role": "implementer"
+    },
+    {
+      "name": "Snake",
+      "role": "implementer"
+    },
+    {
+      "name": "Ghost",
+      "role": "researcher"
+    },
+    {
+      "name": "Rider",
+      "role": "planner"
+    }
+  ],
+  "briefing": null,
+  "settings": {
+    "autoRespond": true,
+    "interject": true,
+    "searchUrl": null,
+    "autoTimers": []
+  }
+}

@@ -647,6 +647,58 @@ const main = async () => {
     fs.rmSync(root2, { recursive: true, force: true });
   });
 
+  await t("per-project task boards (agent-team in cwd)", async () => {
+    const root2 = path.join(root, "prj");
+    await bus.createTeam(root2, "p", {});
+    const proj = path.join(root2, "..", "prj-cwd-" + Date.now());
+    await fs.promises.mkdir(path.join(proj, "agent-team"), { recursive: true });
+    // resolution: project when agent-team exists in cwd, else team
+    const st = bus.resolveTaskStore(root2, "p", proj);
+    ok("project store resolves", st.kind === "project" && st.dir === path.join(proj, "agent-team"));
+    ok("no-cwd falls back to team", bus.resolveTaskStore(root2, "p", undefined).kind === "team");
+    ok("plain cwd without agent-team falls back", bus.resolveTaskStore(root2, "p", root2).kind === "team");
+    // tasks + board land in the project dir, audit stays team-level
+    const t1 = await bus.createTask(root2, "p", { title: "warstate build", assignee: "Bob" }, st.dir);
+    ok("project task created", t1.ok && (await bus.loadTasks(root2, "p", st.dir)).length === 1);
+    ok("team board untouched", (await bus.loadTasks(root2, "p")).length === 0);
+    ok("task file in project dir", fs.existsSync(path.join(st.dir, "tasks.json")));
+    const bw = await bus.writeBoard(root2, "p", "design", "# warstate design", st.dir);
+    ok("project board written", bw.ok && fs.existsSync(path.join(st.dir, "board", "design.md")));
+    ok("audit log is team-level", (await bus.readLog(root2, "p", 50)).some((e) => e.event === "task_created" && e.title === "warstate build"));
+    // transitions work on the project store
+    const done = await bus.updateTask(root2, "p", t1.task.id, { status: "done", evidence: "built" }, { id: "a", name: "Alice", role: "coordinator" }, st.dir);
+    ok("project task transitioned", done.ok && done.task.status === "done");
+    // clear clears the project store only
+    const clr = await bus.clearBoard(root2, "p", { clearTopics: true }, st.dir);
+    ok("project clear works", clr.ok && clr.archived === 1 && (await bus.loadTasks(root2, "p", st.dir)).length === 0);
+    await fs.promises.rm(proj, { recursive: true, force: true });
+    fs.rmSync(root2, { recursive: true, force: true });
+  });
+
+  await t("team definition export/import (portable teams)", async () => {
+    const root2 = path.join(root, "exp");
+    const out = path.join(root, "exp-out");
+    await bus.createTeam(root2, "P", {});
+    await bus.savePreset(root2, "P", [{ name: "Zed", role: "Hub" }, { name: "Mint", role: "Math" }]);
+    await bus.saveBrief(root2, "P", "# mission\nrun the cycles");
+    await bus.setTeamSetting(root2, "P", { autoRespond: true, autoTimers: [{ name: "Zed", minutes: 15, tag: "z", body: "cycle" }] });
+    const ex = await bus.exportTeam(root2, "P", path.join(out, "P.json"));
+    ok("export ok", ex.ok && ex.members === 2 && ex.file === path.join(out, "P.json"));
+    // fresh root: import recreates everything
+    const fresh = path.join(root, "exp-fresh");
+    await fs.promises.mkdir(fresh, { recursive: true });
+    const im = await bus.importTeam(fresh, path.join(out, "P.json"));
+    ok("import ok", im.ok && im.name === "P" && im.members === 2);
+    ok("preset restored", (await bus.loadPreset(fresh, "P")).members.length === 2);
+    ok("briefing restored", (await bus.loadBrief(fresh, "P")).includes("run the cycles"));
+    const meta = await bus.loadTeam(fresh, "P");
+    ok("autoTimers restored", (meta.autoTimers || []).some((t) => t.name === "Zed" && t.minutes === 15));
+    ok("autoRespond restored", meta.autoRespond === true);
+    await fs.promises.rm(out, { recursive: true, force: true });
+    await fs.promises.rm(fresh, { recursive: true, force: true });
+    fs.rmSync(root2, { recursive: true, force: true });
+  });
+
   await t("project memory (MEMORY.md)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memo-"));
     // first append seeds the header
