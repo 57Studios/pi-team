@@ -48,7 +48,7 @@ Custom role names work: `Hub` behaves as coordinator, `Math` as planner,
 | `team later --minutes 30 --body "..."` | set a self-ping timer (persisted; fires a turn at the due time) |
 | `team search "query"` | web search via local SearXNG (no API key; `--categories news`) |
 | `team dm to:"Zilla/Zed"` | **cross-team** DM — lead-to-lead only (both coordinators) |
-| `team board_write/read` | shared board |
+| `team board_write/read` | shared board — **per-project** when working inside a repo with an `agent-team/` dir (`<repo>/agent-team/tasks.json` + `board/`); otherwise the team board |
 | `team memo` | append to `agent-team/MEMORY.md` (project memory) |
 | `team await_members` | blocking wait — pass ALL names at once, one call |
 

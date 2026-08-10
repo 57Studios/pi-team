@@ -72,8 +72,23 @@ export function inboxDir(root, team, memberId) {
   return path.join(teamDir(root, team), "inbox", memberId);
 }
 
-export function boardDir(root, team) {
-  return path.join(teamDir(root, team), "board");
+export function boardDir(root, team, storeDir) {
+  return path.join(storeDir || teamDir(root, team), "board");
+}
+
+// Task/board store resolution: when a member works inside a repo that has an
+// agent-team/ directory, the task board is PER-PROJECT there (<repo>/agent-team/
+// tasks.json + board/). Otherwise it falls back to the team board. The audit
+// log, inboxes, and notifications always stay team-level.
+export function resolveTaskStore(root, team, cwd) {
+  if (cwd) {
+    try {
+      if (fs.existsSync(path.join(cwd, "agent-team"))) {
+        return { dir: path.join(cwd, "agent-team"), kind: "project" };
+      }
+    } catch { /* cwd may not exist */ }
+  }
+  return { dir: teamDir(root, team), kind: "team" };
 }
 
 export function validTeamName(team) {
@@ -909,8 +924,8 @@ export async function hasWakePending(root, team, memberId) {
 // Shared board (markdown artifacts)
 // ---------------------------------------------------------------------------
 
-export async function readBoard(root, team, topic) {
-  const bdir = boardDir(root, team);
+export async function readBoard(root, team, topic, storeDir) {
+  const bdir = boardDir(root, team, storeDir);
   if (topic) {
     try {
       return {
@@ -930,11 +945,11 @@ export async function readBoard(root, team, topic) {
   }
 }
 
-export async function writeBoard(root, team, topic, content) {
+export async function writeBoard(root, team, topic, content, storeDir) {
   if (!BOARD_TOPIC_RE.test(topic || "")) {
     return { ok: false, error: `invalid board topic "${topic}" (letters/digits/._- max 64)` };
   }
-  const file = path.join(boardDir(root, team), `${topic}.md`);
+  const file = path.join(boardDir(root, team, storeDir), `${topic}.md`);
   await writeTextAtomic(file, content);
   await appendLine(
     path.join(teamDir(root, team), "log.jsonl"),
@@ -998,10 +1013,10 @@ export const TASK_STATUSES = ["queued", "running", "blocked", "failed", "done"];
 // Coordinator action: wipe the board so the team can pivot to a new project.
 // Tasks are ARCHIVED first (never destroyed): archive/tasks-<timestamp>.json.
 // Optionally also clears board topics (clearTopics). Audit-logged.
-export async function clearBoard(root, team, { clearTopics = false } = {}) {
+export async function clearBoard(root, team, { clearTopics = false } = {}, storeDir) {
   return withTeamLock(root, team, async () => {
-    const dir = teamDir(root, team);
-    const tasks = await loadTasks(root, team);
+    const dir = storeDir || teamDir(root, team);
+    const tasks = await loadTasks(root, team, storeDir);
     const archiveDir = path.join(dir, "archive");
     await fsp.mkdir(archiveDir, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -1039,8 +1054,8 @@ export async function clearBoard(root, team, { clearTopics = false } = {}) {
   });
 }
 
-export async function loadTasks(root, team) {
-  const data = await readJson(path.join(teamDir(root, team), "tasks.json"), {
+export async function loadTasks(root, team, storeDir) {
+  const data = await readJson(path.join(storeDir || teamDir(root, team), "tasks.json"), {
     tasks: [],
   });
   return Array.isArray(data.tasks) ? data.tasks : [];
@@ -1052,7 +1067,7 @@ export async function loadTasks(root, team) {
 //   criteria[], dependsOn[], createdBy, createdByName, createdAt, assignedAt,
 //   startedAt, doneAt, evidence, blockedReason, failReason, updatedAt }
 
-export async function createTask(root, team, spec) {
+export async function createTask(root, team, spec, storeDir) {
   if (!(await teamExists(root, team))) {
     return { ok: false, error: `Team "${team}" does not exist.` };
   }
@@ -1070,7 +1085,7 @@ export async function createTask(root, team, spec) {
     return { ok: false, error: "a review task requires review_of (the task id being reviewed)" };
   }
   return withTeamLock(root, team, async () => {
-    const tasks = await loadTasks(root, team);
+    const tasks = await loadTasks(root, team, storeDir);
     if (tasks.some((t) => t.id === id)) {
       return { ok: false, error: `task id "${id}" already exists` };
     }
@@ -1119,7 +1134,7 @@ export async function createTask(root, team, spec) {
       updatedAt: Date.now(),
     };
     tasks.push(task);
-    await writeJsonAtomic(path.join(teamDir(root, team), "tasks.json"), { tasks });
+    await writeJsonAtomic(path.join(storeDir || teamDir(root, team), "tasks.json"), { tasks });
     await appendTeamLog(root, team, {
       ts: Date.now(),
       event: "task_created",
@@ -1178,11 +1193,11 @@ export async function createTask(root, team, spec) {
 //     notifies the implementer (the critique gate, made concrete).
 // Notifications are atomic with transitions: done -> creator, blocked/failed
 // -> coordinator (fallback creator), review-fail -> reviewed task's assignee.
-export async function updateTask(root, team, taskId, patch, actor) {
+export async function updateTask(root, team, taskId, patch, actor, storeDir) {
   const meta = await loadTeam(root, team);
   if (!meta) return { ok: false, error: `Team "${team}" does not exist.` };
   return withTeamLock(root, team, async () => {
-    const tasks = await loadTasks(root, team);
+    const tasks = await loadTasks(root, team, storeDir);
     const task = tasks.find((t) => t.id === taskId);
     if (!task) return { ok: false, error: `unknown task "${taskId}"` };
     const warnings = [];
@@ -1502,7 +1517,7 @@ export async function updateTask(root, team, taskId, patch, actor) {
       }
     }
 
-    await writeJsonAtomic(path.join(teamDir(root, team), "tasks.json"), { tasks });
+    await writeJsonAtomic(path.join(storeDir || teamDir(root, team), "tasks.json"), { tasks });
     return { ok: true, task, warnings, notified, bouncedTaskId, acceptedTaskId, lowConfidence, researchTaskId };
   });
 }
