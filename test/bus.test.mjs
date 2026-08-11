@@ -699,6 +699,16 @@ const main = async () => {
     fs.rmSync(root2, { recursive: true, force: true });
   });
 
+  await t("wa_reply outbox (WhatsApp dispatcher queue)", async () => {
+    const root2 = path.join(root, "waq");
+    const bd = path.join(root2, "wa-bridge");
+    const r = await bus.queueWaReply(bd, { to: "15551234567", body: "on it", fromName: "Dispatcher", team: "Dispatch" });
+    ok("reply queued", r.ok && r.file.startsWith(bd));
+    const file = JSON.parse(await fs.promises.readFile(r.file, "utf8"));
+    ok("reply payload", file.to === "15551234567" && file.body === "on it" && file.team === "Dispatch");
+    fs.rmSync(root2, { recursive: true, force: true });
+  });
+
   await t("project memory (MEMORY.md)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memo-"));
     // first append seeds the header

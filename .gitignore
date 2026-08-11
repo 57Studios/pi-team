@@ -2,3 +2,8 @@ node_modules/
 *.tmp-*
 .DS_Store
 *.log
+
+# WhatsApp bridge: deps + any local env. Session auth lives in ~/.pi/wa-bridge
+# (outside the repo) and is NEVER committed.
+bridge/node_modules/
+bridge/.env

@@ -35,7 +35,7 @@ const ACTIONS = [
   "inbox", "board_write", "board_read", "status", "whoami", "set_role",
   "spawn", "selftest",
   "task_create", "task_list", "task_show", "task_start", "task_done", "task_blocked", "task_fail", "task_assign",
-  "preset_show", "preset_save", "preset_create", "revive", "briefing", "memo", "config", "await_members", "kick", "checkin", "later", "timers", "search", "clear", "export", "import",
+  "preset_show", "preset_save", "preset_create", "revive", "briefing", "memo", "config", "await_members", "kick", "checkin", "later", "timers", "search", "clear", "export", "import", "wa_reply",
 ] as const;
 
 const TEAM_IDENTITY_ENTRY = "team-identity";
@@ -67,6 +67,9 @@ export default function (pi: ExtensionAPI) {
       team: process.env.PI_TEAM?.trim() || undefined,
       role: process.env.PI_TEAM_ROLE?.trim() || undefined,
       name: process.env.PI_TEAM_NAME?.trim() || undefined,
+      // Stable member id: lets external bridges (WhatsApp) address this
+      // member's inbox without knowing the session id (PI_TEAM_ID).
+      id: process.env.PI_TEAM_ID?.trim() || undefined,
     };
   }
 
@@ -123,7 +126,7 @@ export default function (pi: ExtensionAPI) {
     if (!ident) return null;
     const root = ident.root;
     if (!(await bus.teamExists(root, ident.team))) return null;
-    const id = safeSessionId(c2);
+    const id = ident.id || safeSessionId(c2);
     const jr = await bus.joinMember(root, ident.team, {
       id,
       name: ident.name,
@@ -809,6 +812,16 @@ export default function (pi: ExtensionAPI) {
     return null;
   }
 
+  // Resolve a read-only target team for dispatcher actions: --team <name>
+  // (any team) or default to my own team. Case-insensitive; unknown -> error.
+  async function readTeam(me: NonNullable<Awaited<ReturnType<typeof myTeam>>>, p: Record<string, any>) {
+    const want = String(p.team || "").trim();
+    if (!want) return { team: me.team, members: await bus.loadMembers(me.root, me.team), ok: true };
+    const t = (await bus.resolveTeamName(me.root, want)) || null;
+    if (!t) return { ok: false, error: `unknown team "${want}"` };
+    return { team: t, members: await bus.loadMembers(me.root, t), ok: true };
+  }
+
   // Per-project task board: <cwd>/agent-team when present, else team board.
   async function taskStore(me: NonNullable<Awaited<ReturnType<typeof myTeam>>>, c: ExtensionContext) {
     return bus.resolveTaskStore(me.root, me.team, c?.cwd);
@@ -963,12 +976,13 @@ export default function (pi: ExtensionAPI) {
 
       case "roster": {
         if (!me) return notInTeam;
-        const members = await bus.loadMembers(root, me.team);
+        const tgt = await readTeam(me, p);
+        if (!tgt.ok) return `error: ${tgt.error}`;
         const now = Date.now();
         const rows = bus
-          .rosterList(members, me.id)
+          .rosterList(tgt.members, me.id)
           .map((m) => `- ${m.name} (${m.role}) — ${bus.isMemberDead(m, now) ? "offline" : m.status || "idle"}${m.self ? " (you)" : ""}`);
-        return `Team "${me.team}" — ${Object.keys(members).length} member(s):\n${rows.join("\n")}`;
+        return `Team "${tgt.team}" — ${Object.keys(tgt.members).length} member(s):\n${rows.join("\n")}`;
       }
 
       case "whoami": {
@@ -1089,8 +1103,10 @@ export default function (pi: ExtensionAPI) {
           : String(p.criteria || "").split(/\n|;/).map((s) => s.trim()).filter(Boolean);
         const dependsOn = Array.isArray(p.depends_on) ? p.depends_on.map(String) : [];
         const assignee = p.to ? String(p.to).trim() : null;
-        const store = await taskStore(me, c);
-        const res = await bus.createTask(root, me.team, {
+        const tgt = await readTeam(me, p);
+        if (!tgt.ok) return `error: ${tgt.error}`;
+        const store = p.project ? { dir: path.join(String(p.project).trim(), "agent-team"), kind: "project" } : await taskStore(me, c);
+        const res = await bus.createTask(root, tgt.team, {
           title,
           body: p.body,
           assignee,
@@ -1112,8 +1128,10 @@ export default function (pi: ExtensionAPI) {
 
       case "task_list": {
         if (!me) return notInTeam;
-        const store = await taskStore(me, c);
-        const tasks = await bus.loadTasks(root, me.team, store.dir);
+        const tgt = await readTeam(me, p);
+        if (!tgt.ok) return `error: ${tgt.error}`;
+        const store = p.project ? { dir: path.join(String(p.project).trim(), "agent-team"), kind: "project" } : await taskStore(me, c);
+        const tasks = await bus.loadTasks(root, tgt.team, store.dir);
         if (!tasks.length) return `Task board empty${store.kind === "project" ? ` (project ${store.dir})` : ""}. Create tasks with team task_create.`;
         return tasks
           .map((t: any) => `[${t.status}] ${t.id} — ${t.title}${t.assignee ? ` (-> ${t.assignee})` : ""}`)
@@ -1254,6 +1272,23 @@ export default function (pi: ExtensionAPI) {
         const res = await bus.clearBoard(root, me.team, { clearTopics: p.board === true || p.all === true }, store.dir);
         if (!res.ok) return `error: ${res.error}`;
         return `Board cleared: archived ${res.archived} task${res.archived === 1 ? "" : "s"} (${res.done} done) to ${res.archive}${res.topicsCleared ? `; cleared ${res.topicsCleared} board topic(s)` : ""}. ${store.kind === "project" ? `Project board (${store.dir})` : `Team "${me.team}"`} is ready for a new project.`;
+      }
+
+      case "wa_reply": {
+        if (!me) return notInTeam;
+        const body = String(p.body || "").trim();
+        if (!body) return "error: body required (the WhatsApp reply text).";
+        const bridgeDir = process.env.PI_WA_DIR?.trim() || path.join(process.env.HOME || "/tmp", ".pi", "wa-bridge");
+        let to = String(p.to || "").trim();
+        if (!to) {
+          try {
+            const ls = JSON.parse(fs.readFileSync(path.join(bridgeDir, "last-sender.json"), "utf8"));
+            to = ls.jid || "";
+          } catch { /* no recent sender */ }
+        }
+        if (!to) return "error: no recent WhatsApp sender — pass to (the phone number) explicitly.";
+        await bus.queueWaReply(bridgeDir, { to, body, fromName: me.name, team: me.team, ts: Date.now() });
+        return `Queued WhatsApp reply to ${to}: "${body}". The bridge will send it.`;
       }
 
       case "export": {
@@ -1443,6 +1478,8 @@ export default function (pi: ExtensionAPI) {
       auto_timers: Type.Optional(Type.String({ description: "For config (coordinator): standing cadence timers 'Name:minutes:body;Name2:30:body2' — auto-armed at session start, re-armed after each fire." })),
       query: Type.Optional(Type.String({ description: "For search: the web query (SearXNG, local)." })),
       file: Type.Optional(Type.String({ description: "For export/import: path to the team definition file." })),
+      team: Type.Optional(Type.String({ description: "For dispatcher reads (roster/task_list/task_create): inspect another team by name." })),
+      project: Type.Optional(Type.String({ description: "For task_list/task_create: operate on a project board by repo path (uses <path>/agent-team)." })),
       count: Type.Optional(Type.Number({ description: "For search: max results (1-10, default 6)." })),
       categories: Type.Optional(Type.String({ description: "For search: SearXNG categories, e.g. 'news,general'." })),
       timeout_minutes: Type.Optional(Type.Number({ description: "For await_members: max minutes to wait (1-30, default 3)." })),

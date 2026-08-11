@@ -1686,6 +1686,17 @@ export async function importTeam(root, file) {
   return { ok: true, name, members: (def.preset || []).length };
 }
 
+// WhatsApp bridge outbox: the dispatcher queues replies here; the bridge
+// daemon (bridge/index.mjs) drains them and sends on WhatsApp. Lives outside
+// the repo (default ~/.pi/wa-bridge) so credentials never touch git.
+export async function queueWaReply(bridgeDir, { to, body, fromName, team, ts = Date.now() }) {
+  const dir = path.join(bridgeDir, "outbox");
+  await fsp.mkdir(dir, { recursive: true });
+  const file = path.join(dir, `${ts}-${randomUUID().slice(0, 6)}.json`);
+  await writeJsonAtomic(file, { to, body, fromName, team, ts });
+  return { ok: true, file };
+}
+
 export async function loadPreset(root, team) {
   const data = await readJson(path.join(teamDir(root, team), "preset.json"), null);
   return data && Array.isArray(data.members) ? data : null;

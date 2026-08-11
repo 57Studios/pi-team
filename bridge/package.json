@@ -1,0 +1,15 @@
+{
+  "name": "pi-team-wa-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "WhatsApp bridge for the pi-team dispatcher (session/auth stay outside the repo)",
+  "dependencies": {
+    "baileys": "^6.7.16",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "scripts": {
+    "start": "node index.mjs",
+    "test": "node test/lib.test.mjs"
+  }
+}
