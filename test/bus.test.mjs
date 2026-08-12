@@ -203,6 +203,18 @@ const main = async () => {
     await bus.writeJsonAtomic(path.join(bus.teamDir(root2, "team3"), "members.json"), { members });
     const jr2 = await bus.joinMember(root2, "team3", { id: "revived", name: "Ann", role: "implementer" });
     ok("stale heartbeat name reclaimed on rejoin", jr2.ok);
+    // POWER-LOSS regression: a session whose heartbeat stopped seconds before
+    // a power cut is still "idle" (no offline mark) and its lastSeen is only a
+    // few minutes old. With STALE_MEMBER_MS = 2 min it must be reclaimable
+    // right after boot — this was the "team won't spawn after power loss" bug
+    // (the 5-min window made every name look live-held for ~5 min post-boot).
+    await bus.joinMember(root2, "team3", { id: "powerlost", name: "Cal", role: "implementer" });
+    const pl = await bus.loadMembers(root2, "team3");
+    pl["powerlost"].status = "idle"; // power cut: session_shutdown never ran
+    pl["powerlost"].lastSeen = Date.now() - (bus.STALE_MEMBER_MS + 30_000); // 2.5 min ago
+    await bus.writeJsonAtomic(path.join(bus.teamDir(root2, "team3"), "members.json"), { members: pl });
+    const jr3 = await bus.joinMember(root2, "team3", { id: "post-reboot", name: "Cal", role: "implementer" });
+    ok("power-loss stale-idle name reclaimed immediately post-boot", jr3.ok);
     // preset tracks the intended roster
     const preset = await bus.loadPreset(root2, "team3");
     ok("preset exists with members", preset && preset.members.some((m) => m.name === "Zed") && preset.members.some((m) => m.name === "Ann"));

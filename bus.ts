@@ -27,7 +27,7 @@ export function isMemberDead(m, now = Date.now()) {
 // itself offline (graceful shutdown) or its heartbeat has gone stale. Live
 // members touch lastSeen every HEARTBEAT_MS, so a stale lastSeen means the
 // process is gone (crash, power loss) — names of dead sessions are free.
-export const STALE_MEMBER_MS = 5 * 60 * 1000;
+export const STALE_MEMBER_MS = 2 * 60 * 1000;
 export const HEARTBEAT_MS = 60 * 1000;
 // Locks are held for milliseconds; anything older than this is a dead lock
 // (process killed mid-operation) and safe to reclaim.
@@ -350,7 +350,7 @@ export async function joinMember(root, team, { id, name, role, rejoin = false })
         if (!dead) {
           return {
             ok: false,
-            error: `Name "${name}" is held by a LIVE member (${sid.slice(0, 8)}…). If that session is dead, it frees the name automatically once its heartbeat goes stale (~5 min), or a coordinator can run /team prune --hours 0 to reap it now. Otherwise pick a unique name with --name.`,
+            error: `Name "${name}" is held by a LIVE member (${sid.slice(0, 8)}…). If that session is dead, it frees the name automatically once its heartbeat goes stale (~2 min), or a coordinator can run /team prune --hours 0 to reap it now. Otherwise pick a unique name with --name.`,
           };
         }
         delete members[sid]; // reclaim the name from the dead session

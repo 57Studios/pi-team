@@ -133,7 +133,14 @@ export default function (pi: ExtensionAPI) {
       role: ident.role,
       rejoin: true,
     });
-    if (!jr.ok) return null;
+    if (!jr.ok) {
+      try {
+        console.error(`[team] join failed: ${jr.error}`);
+      } catch {
+        /* ignore */
+      }
+      return null;
+    }
     memberId = id;
     lastTeam = { root, team: ident.team, id };
     // Note: joinMember already resets status to "idle" on (re)join, so a
@@ -590,7 +597,19 @@ export default function (pi: ExtensionAPI) {
     if ((coord as any)?.id) process.env.PI_TEAM_ID = (coord as any).id;
     process.env.PI_TEAM_DIR = root;
     const me = await myTeam(c);
-    if (!me) return;
+    if (!me) {
+      // Never fail silently ("no name no nothing"): explain why the join
+      // didn't happen so the user knows what to do.
+      try {
+        c.ui.notify(
+          `[team] Could not join "${resolved}" — a roster session may still hold your name (it frees itself ~2 min after its last heartbeat, e.g. after a power loss; or run: team prune --hours 0). No team spawned.`,
+          "error",
+        );
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
     startWatcher(me);
     applyTitle(c, me);
     await seedMemo(c, me);
@@ -607,7 +626,7 @@ export default function (pi: ExtensionAPI) {
         (x: any) =>
           x.name === m.name &&
           x.status !== "offline" &&
-          now - (x.lastSeen || 0) < 90_000, // heartbeat is 60s: >90s = dead, respawn
+          now - (x.lastSeen || 0) < bus.STALE_MEMBER_MS, // stale heartbeat = dead (2 min), respawn
       );
       if (live) {
         skipped.push(m.name);
