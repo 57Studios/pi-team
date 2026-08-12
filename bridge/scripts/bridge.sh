@@ -1,43 +1,41 @@
 #!/usr/bin/env bash
 # pi-team WhatsApp bridge control: start | stop | status | logs
 # Session auth lives in ~/.pi/wa-bridge/ (OUTSIDE the repo) — never committed.
+# Works from any directory.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+BRIDGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRIDGE_DIR="${PI_WA_DIR:-$HOME/.pi/wa-bridge}"
 PIDFILE="$BRIDGE_DIR/bridge.pid"
 LOGFILE="$BRIDGE_DIR/bridge.log"
 
-# Owner numbers (required): add your WhatsApp number(s), comma/space separated.
-#   WA_OWNERS="+15551234567 +14155559876" scripts/bridge.sh start
 OWNERS="${WA_OWNERS:-}"
+alive() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
 
 cmd="${1:-status}"
 case "$cmd" in
   start)
     [ -n "$OWNERS" ] || { echo "error: set WA_OWNERS (your number). e.g. WA_OWNERS=+15551234567 scripts/bridge.sh start" >&2; exit 1; }
-    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-      echo "already running (pid $(cat "$PIDFILE"))"
-      exit 0
-    fi
+    if alive; then echo "already running (pid $(cat "$PIDFILE"))"; exit 0; fi
+    rm -f "$PIDFILE"
     mkdir -p "$BRIDGE_DIR"
-    (cd bridge && WA_OWNERS="$OWNERS" PI_WA_DIR="$BRIDGE_DIR" nohup node index.mjs >> "$LOGFILE" 2>&1 & echo $! > "$PIDFILE")
-    sleep 2
-    echo "started (pid $(cat "$PIDFILE")). Logs: $LOGFILE"
-    echo "first run: scan the QR it prints in the log — tail -f $LOGFILE"
+    ( cd "$BRIDGE_ROOT" && WA_OWNERS="$OWNERS" PI_WA_DIR="$BRIDGE_DIR" nohup node index.mjs >> "$LOGFILE" 2>&1 & echo $! > "$PIDFILE" )
+    sleep 3
+    if alive; then
+      echo "started (pid $(cat "$PIDFILE")). Logs: $LOGFILE"
+      echo "first run: scan the QR it prints —  scripts/bridge.sh logs"
+    else
+      echo "FAILED to start — check the log:"; tail -5 "$LOGFILE" 2>/dev/null || true
+      exit 1
+    fi
     ;;
   stop)
-    [ -f "$PIDFILE" ] || { echo "not running"; exit 0; }
-    kill "$(cat "$PIDFILE")" 2>/dev/null && echo "stopped (WhatsApp session persists — no rescan needed)" || echo "no process"
+    if alive; then kill "$(cat "$PIDFILE")" && echo "stopped (WhatsApp session persists — no rescan needed)"; else echo "not running"; fi
     rm -f "$PIDFILE"
     ;;
   status)
-    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-      echo "running (pid $(cat "$PIDFILE"))"
-      tail -3 "$LOGFILE" 2>/dev/null || true
-    else
-      echo "not running"
-    fi
+    if alive; then echo "running (pid $(cat "$PIDFILE"))"; tail -3 "$LOGFILE" 2>/dev/null || true
+    else echo "not running"; fi
     ;;
-  logs) tail -f "$LOGFILE" 2>/dev/null || echo "no log yet" ;;
+  logs) tail -f "$LOGFILE" 2>/dev/null || echo "no log yet — run start first" ;;
   *) echo "usage: $0 {start|stop|status|logs}" >&2; exit 2 ;;
 esac

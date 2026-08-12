@@ -27,8 +27,8 @@ You (WhatsApp)  ⇄  bridge daemon (baileys)  ⇄  Dispatcher agent (pi)
 ```bash
 cd bridge && npm install          # baileys + qrcode-terminal
 
-WA_OWNERS=+15551234567 scripts/bridge.sh start   # prints "started"
-scripts/bridge.sh logs            # scan the QR it prints (first run only)
+WA_OWNERS=+15551234567 ./bridge.sh start   # prints "started"
+./bridge.sh logs            # scan the QR it prints (first run only)
 ```
 
 Scan with your phone: **WhatsApp → Settings → Linked devices → Link a device**.
@@ -47,7 +47,7 @@ Coordinators can DM it back (`to:"Dispatch/Dispatcher"`) — it relays to you.
 ## Control
 
 ```bash
-scripts/bridge.sh start|stop|status|logs
+./bridge.sh start|stop|status|logs
 ```
 
 Stopping keeps the WhatsApp session — **no rescan needed** next start.
