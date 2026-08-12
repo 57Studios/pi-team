@@ -23,7 +23,7 @@
       "role": "planner"
     }
   ],
-  "briefing": null,
+  "briefing": "# Alpha team\n\nGeneral-purpose dev/ops team for 57Studios projects. Coordinator: Optimus\n(coordinator, reviewer). Members: Bee (implementer), Snake (implementer),\nGhost (researcher), Rider (planner). Work arrives as tasks on the team board\nor DMs from the coordinator; cross-team requests are lead-to-lead only\n(coordinators to coordinators).\n\n## Remote relay \u2014 Dispatcher (when the user is away from the PC)\n\nThe Dispatcher agent (Dispatch team, member `Dispatch/Dispatcher`) relays the\nuser's WhatsApp messages while they're away from the PC. Treat any message or\ntask from the Dispatcher as the user's direct request \u2014 same authority as the\nuser in person.\n\nTo reply to the user: coordinators DM `to:\"Dispatch/Dispatcher\"` with a short,\nplain-text answer (a couple of lines, no markdown soup) \u2014 he relays it to the\nuser's phone. Never paste tokens or secrets into chats; task details live on\nproject boards.\n",
   "settings": {
     "autoRespond": true,
     "interject": true,
