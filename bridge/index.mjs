@@ -4,7 +4,7 @@
 // Dispatcher's wa-reply queue back to WhatsApp.
 //
 // Session auth lives in ~/.pi/wa-bridge/auth (OUTSIDE the repo) — never commit it.
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from "baileys";
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } from "baileys";
 import QRCode from "qrcode";
 import pino from "pino";
 import { loadConfig, isAllowed, buildInboundEnvelope, deliverInbound, drainOutbox, rememberSender } from "./lib.mjs";
@@ -28,6 +28,10 @@ const { version } = await fetchLatestBaileysVersion();
 const sock = makeWASocket({
   version,
   auth: state,
+  // macOS/Safari fingerprint: WhatsApp's server bounces the default
+  // Ubuntu/Chrome UA (connection closed 515 mid-link). macOS/Safari held a
+  // 90s probe stable; Ubuntu/Chrome closed within ~50s every time.
+  browser: Browsers.macOS("Safari"),
   printQRInTerminal: false, // we print our own (once, scannable)
   logger: pino({ level: "silent" }), // baileys internals stay quiet; we log ourselves
 });
