@@ -22,10 +22,13 @@ if (!cfg.owners.length) {
   process.exit(1);
 }
 
-const { state, saveCreds } = await useMultiFileAuthState(`${cfg.bridgeDir}/auth`);
-const { version } = await fetchLatestBaileysVersion();
+let sock = null;
 
-const sock = makeWASocket({
+async function startSocket() {
+  const { state, saveCreds } = await useMultiFileAuthState(`${cfg.bridgeDir}/auth`);
+  const { version } = await fetchLatestBaileysVersion();
+
+  sock = makeWASocket({
   version,
   auth: state,
   // Custom browser fingerprint (pattern proven in production by Hermes Agent's
@@ -44,11 +47,11 @@ const sock = makeWASocket({
   logger: pino({ level: "warn" }),
 });
 
-let lastQr = null;
-let printedQr = false;
-let pairDone = false;
+  let lastQr = null;
+  let printedQr = false;
+  let pairDone = false;
 
-sock.ev.on("connection.update", async (update) => {
+  sock.ev.on("connection.update", async (update) => {
   const { connection, lastDisconnect, qr } = update;
   if (qr) {
     lastQr = qr;
@@ -108,34 +111,44 @@ sock.ev.on("connection.update", async (update) => {
       log("logged out from the phone — delete", `${cfg.bridgeDir}/auth`, "and rescan to re-link.");
       process.exit(0);
     }
-    // reconnect (baileys reconnects automatically; nothing else to do here)
+    // 515 = WhatsApp asked us to restart (normal after pairing — the session
+    // is saved and the reconnect continues with the new creds).
+    // 408 = "QR refs attempts ended" — the QR expired with no scan; keep
+    // cycling so a fresh scannable QR is always waiting.
+    // Any other close = transient; reconnect too.
+    const delay = code === 515 || code === 408 ? 1000 : 3000;
+    log(code === 515 ? "↻ WhatsApp requested restart (515) — reconnecting"
+        : code === 408 ? "↻ QR expired without a scan (408) — rotating a fresh one"
+        : "↻ reconnecting...");
+    setTimeout(startSocket, delay);
   }
-});
+  });
 
-sock.ev.on("creds.update", saveCreds);
+  sock.ev.on("creds.update", saveCreds);
 
-// ---- inbound: owner texts -> Dispatcher inbox ----------------------------
-sock.ev.on("messages.upsert", async ({ messages, type }) => {
-  for (const m of messages) {
-    if (m.key?.fromMe) continue; // ignore our own outgoing
-    const text = m.message?.conversation ?? m.message?.extendedTextMessage?.text;
-    if (!text) continue;
-    const number = (m.key.remoteJid || "").replace("@s.whatsapp.net", "");
-    if (!isAllowed(number, cfg.owners)) {
-      log("ignored message from non-owner:", number);
-      continue;
+  // ---- inbound: owner texts -> Dispatcher inbox --------------------------
+  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    for (const m of messages) {
+      if (m.key?.fromMe) continue; // ignore our own outgoing
+      const text = m.message?.conversation ?? m.message?.extendedTextMessage?.text;
+      if (!text) continue;
+      const number = (m.key.remoteJid || "").replace("@s.whatsapp.net", "");
+      if (!isAllowed(number, cfg.owners)) {
+        log("ignored message from non-owner:", number);
+        continue;
+      }
+      log("inbound from", number, "->", String(text).slice(0, 80));
+      await rememberSender(cfg.bridgeDir, number);
+      const envelope = buildInboundEnvelope({ from: number, fromName: `You (${number})`, body: text });
+      try {
+        await deliverInbound(cfg.teamsRoot, cfg.team, cfg.memberId, envelope);
+        log("delivered to", cfg.team, "/", cfg.memberId);
+      } catch (e) {
+        log("delivery failed:", e?.message);
+      }
     }
-    log("inbound from", number, "->", String(text).slice(0, 80));
-    await rememberSender(cfg.bridgeDir, number);
-    const envelope = buildInboundEnvelope({ from: number, fromName: `You (${number})`, body: text });
-    try {
-      await deliverInbound(cfg.teamsRoot, cfg.team, cfg.memberId, envelope);
-      log("delivered to", cfg.team, "/", cfg.memberId);
-    } catch (e) {
-      log("delivery failed:", e?.message);
-    }
-  }
-});
+  });
+}
 
 // ---- outbound: Dispatcher's wa-reply queue -> WhatsApp --------------------
 setInterval(async () => {
@@ -155,3 +168,5 @@ setInterval(async () => {
 
 process.on("SIGINT", () => { log("stopping (session persists — no rescan needed next time)"); process.exit(0); });
 process.on("SIGTERM", () => process.exit(0));
+
+startSocket().catch((e) => { log("socket start failed:", e?.message); process.exit(1); });
