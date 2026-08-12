@@ -10,13 +10,18 @@ LOGFILE="$BRIDGE_DIR/bridge.log"
 
 OWNERS="${WA_OWNERS:-}"
 alive() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
+# kill EVERY daemon by name (pidfile pids drift with subshell backgrounding)
+kill_all() {
+  pkill -f "node index.mjs" 2>/dev/null || true
+  rm -f "$PIDFILE"
+}
 
 cmd="${1:-status}"
 case "$cmd" in
   start)
     [ -n "$OWNERS" ] || { echo "error: set WA_OWNERS (your number). e.g. WA_OWNERS=+15551234567 scripts/bridge.sh start" >&2; exit 1; }
     if alive; then echo "already running (pid $(cat "$PIDFILE"))"; exit 0; fi
-    rm -f "$PIDFILE"
+    kill_all
     mkdir -p "$BRIDGE_DIR"
     ( cd "$BRIDGE_ROOT" && WA_OWNERS="$OWNERS" PI_WA_DIR="$BRIDGE_DIR" nohup node index.mjs >> "$LOGFILE" 2>&1 & echo $! > "$PIDFILE" )
     sleep 3
@@ -29,8 +34,8 @@ case "$cmd" in
     fi
     ;;
   stop)
-    if alive; then kill "$(cat "$PIDFILE")" && echo "stopped (WhatsApp session persists — no rescan needed)"; else echo "not running"; fi
-    rm -f "$PIDFILE"
+    kill_all
+    echo "stopped (WhatsApp session persists — no rescan needed)"
     ;;
   status)
     if alive; then echo "running (pid $(cat "$PIDFILE"))"; tail -3 "$LOGFILE" 2>/dev/null || true
