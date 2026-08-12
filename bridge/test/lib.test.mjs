@@ -12,6 +12,8 @@ import {
   rememberSender,
   lastSender,
   loadConfig,
+  loadLidMap,
+  resolveSender,
 } from "../lib.mjs";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "wa-test-"));
@@ -69,11 +71,50 @@ await t("outbox queue round-trip (enqueue -> drain in order, acked)", async () =
   assert.equal((await drainOutbox(bridgeDir)).length, 0); // acked
 });
 
-await t("rememberSender / lastSender round-trip", async () => {
+await t("rememberSender / lastSender round-trip (digits and full jids)", async () => {
   const bridgeDir = path.join(root, "bridge2");
   await rememberSender(bridgeDir, "+15551234567");
   assert.equal(await lastSender(bridgeDir), "15551234567");
+  await rememberSender(bridgeDir, "11111111111@lid");
+  assert.equal(await lastSender(bridgeDir), "11111111111@lid");
+  await rememberSender(bridgeDir, "+15551234567:10@s.whatsapp.net");
+  assert.equal(await lastSender(bridgeDir), "15551234567@s.whatsapp.net");
   assert.equal(await lastSender(path.join(root, "nope")), null);
+});
+
+await t("loadLidMap builds both directions from auth dir files", async () => {
+  const auth = path.join(root, "auth");
+  fs.mkdirSync(auth, { recursive: true });
+  fs.writeFileSync(path.join(auth, "lid-mapping-15551234567.json"), JSON.stringify("11111111111"));
+  fs.writeFileSync(path.join(auth, "lid-mapping-11111111111_reverse.json"), JSON.stringify("15551234567"));
+  const map = await loadLidMap(auth);
+  assert.equal(map.lidToPhone["11111111111"], "15551234567");
+  assert.equal(map.phoneToLid["15551234567"], "11111111111");
+  assert.equal((await loadLidMap(path.join(root, "noauth"))).lidToPhone["1"], undefined); // no auth: empty map, no throw
+});
+
+await t("resolveSender maps @lid jids to the phone via the lid map", async () => {
+  const map = { lidToPhone: { "11111111111": "15551234567" }, phoneToLid: {} };
+  const lid = resolveSender("11111111111@lid", map);
+  assert.equal(lid.phone, "15551234567");
+  assert.equal(lid.isLid, true);
+  assert.equal(lid.jid, "11111111111@lid");
+  const classic = resolveSender("15551234567@s.whatsapp.net", map);
+  assert.equal(classic.phone, "15551234567");
+  assert.equal(classic.isLid, false);
+  const withDev = resolveSender("15551234567:10@s.whatsapp.net", map);
+  assert.equal(withDev.jid, "15551234567@s.whatsapp.net");
+  const unknown = resolveSender("99999999999@lid", map); // not in map
+  assert.equal(unknown.phone, null);
+});
+
+await t("owner allowlist accepts a LID-resolved phone and rejects others", async () => {
+  const owners = ["15551234567"];
+  const map = { lidToPhone: { "11111111111": "15551234567" }, phoneToLid: {} };
+  const owner = resolveSender("11111111111@lid", map);
+  assert.equal(isAllowed(owner.phone, owners), true);
+  const stranger = resolveSender("99999999999@lid", map);
+  assert.equal(isAllowed(stranger.phone, owners), false);
 });
 
 await t("loadConfig defaults are OUTSIDE the repo", () => {

@@ -35,6 +35,72 @@ export function isAllowed(number, owners) {
   return n ? owners.includes(n) : false;
 }
 
+// Normalize a WhatsApp jid OR a bare number: "+1555...@s.whatsapp.net" ->
+// "1555...@s.whatsapp.net", "11111111111@lid" stays, bare "+1555..." ->
+// digits only. Used for reply routing (baileys 7 accepts @lid jids directly).
+function normalizeJid(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return null;
+  if (s.includes("@")) {
+    const [local, ...rest] = s.split("@");
+    // strip a device suffix ("1555...:10") before digit-normalizing
+    const digits = local.split(":")[0].replace(/[^0-9]/g, "");
+    if (!digits) return null;
+    return `${digits}@${rest.join("@")}`;
+  }
+  return normalizeNumber(s);
+}
+
+// WhatsApp now identifies contacts by opaque LIDs (@lid) instead of phone
+// numbers, and baileys persists the mapping as lid-mapping-*.json files in the
+// auth dir (two flavors: lid-mapping-<phone>.json -> the LID, and
+// lid-mapping-<lid>_reverse.json -> the phone). Build both directions so the
+// allowlist and the envelope's display number work in either form.
+export async function loadLidMap(authDir) {
+  const map = { lidToPhone: {}, phoneToLid: {} };
+  let files = [];
+  try {
+    files = await readdir(authDir);
+  } catch {
+    return map; // no auth yet (pre-link): empty map, allowlist still works for phone-form jids
+  }
+  for (const f of files) {
+    const m = f.match(/^lid-mapping-(\d+)(_reverse)?\.json$/);
+    if (!m) continue;
+    const key = m[1];
+    let val = null;
+    try {
+      val = String(JSON.parse(await readFile(path.join(authDir, f), "utf8"))).replace(/[^0-9]/g, "");
+    } catch {
+      continue;
+    }
+    if (!val) continue;
+    if (m[2]) {
+      // lid-mapping-<lid>_reverse.json -> the phone
+      map.lidToPhone[key] = val;
+      map.phoneToLid[val] = key;
+    } else {
+      // lid-mapping-<phone>.json -> the LID
+      map.phoneToLid[key] = val;
+      map.lidToPhone[val] = key;
+    }
+  }
+  return map;
+}
+
+// Resolve an inbound remoteJid to { jid (normalized, reply-routable), phone
+// (digits; LID resolved via the map when the jid is @lid), isLid }.
+export function resolveSender(rawJid, lidMap = { lidToPhone: {}, phoneToLid: {} }) {
+  const jid = normalizeJid(rawJid);
+  if (!jid) return { jid: null, phone: null, isLid: false };
+  const isLid = jid.endsWith("@lid");
+  if (isLid) {
+    const digits = jid.split("@")[0];
+    return { jid, phone: lidMap.lidToPhone[digits] || null, isLid: true };
+  }
+  return { jid, phone: jid.split("@")[0], isLid: false };
+}
+
 // Envelope written into the Dispatcher's pi-team inbox. Same shape the bus
 // writes, so the Dispatcher's watcher auto-reads it (wake: true -> turn).
 export function buildInboundEnvelope({ from, fromName, body, ts = Date.now() }) {
@@ -104,12 +170,13 @@ export async function drainOutbox(bridgeDir) {
   return out;
 }
 
-// Track the most recent inbound sender so wa-reply can default to it.
+// Track the most recent inbound sender so wa-reply can default to it. Stores
+// the reply-routable jid (LID or phone form, normalized).
 export async function rememberSender(bridgeDir, number) {
-  const n = normalizeNumber(number);
-  if (!n) return;
+  const jid = normalizeJid(number);
+  if (!jid) return;
   await mkdir(bridgeDir, { recursive: true });
-  await writeFile(path.join(bridgeDir, "last-sender.json"), JSON.stringify({ jid: n, at: Date.now() }));
+  await writeFile(path.join(bridgeDir, "last-sender.json"), JSON.stringify({ jid, at: Date.now() }));
 }
 
 export async function lastSender(bridgeDir) {

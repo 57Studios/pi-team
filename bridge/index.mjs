@@ -7,7 +7,7 @@
 import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } from "baileys";
 import QRCode from "qrcode";
 import pino from "pino";
-import { loadConfig, isAllowed, buildInboundEnvelope, deliverInbound, drainOutbox, rememberSender } from "./lib.mjs";
+import { loadConfig, isAllowed, buildInboundEnvelope, deliverInbound, drainOutbox, rememberSender, lastSender, loadLidMap, resolveSender } from "./lib.mjs";
 
 const cfg = loadConfig();
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -23,6 +23,18 @@ if (!cfg.owners.length) {
 }
 
 let sock = null;
+let lidMap = { lidToPhone: {}, phoneToLid: {} };
+let lastLidScan = 0;
+
+async function refreshLidMap(force = false) {
+  // Contacts are discovered continuously; rescan the auth dir at most once a
+  // minute (or when a new creds.update lands) — reading ~hundreds of tiny
+  // files per message would be wasteful.
+  const now = Date.now();
+  if (!force && now - lastLidScan < 60_000) return;
+  lastLidScan = now;
+  lidMap = await loadLidMap(`${cfg.bridgeDir}/auth`);
+}
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(`${cfg.bridgeDir}/auth`);
@@ -124,22 +136,25 @@ async function startSocket() {
   }
   });
 
-  sock.ev.on("creds.update", saveCreds);
+  sock.ev.on("creds.update", async () => { saveCreds(); await refreshLidMap(true); });
 
   // ---- inbound: owner texts -> Dispatcher inbox --------------------------
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    await refreshLidMap();
     for (const m of messages) {
       if (m.key?.fromMe) continue; // ignore our own outgoing
       const text = m.message?.conversation ?? m.message?.extendedTextMessage?.text;
       if (!text) continue;
-      const number = (m.key.remoteJid || "").replace("@s.whatsapp.net", "");
-      if (!isAllowed(number, cfg.owners)) {
-        log("ignored message from non-owner:", number);
+      // WhatsApp now routes inbound DMs by LID (@lid) rather than phone
+      // number; resolve the LID to the owner's phone for the allowlist.
+      const { jid, phone } = resolveSender(m.key.remoteJid, lidMap);
+      if (!phone || !isAllowed(phone, cfg.owners)) {
+        log("ignored message from non-owner:", m.key.remoteJid, phone ? `(resolved ${phone})` : "(no lid mapping)");
         continue;
       }
-      log("inbound from", number, "->", String(text).slice(0, 80));
-      await rememberSender(cfg.bridgeDir, number);
-      const envelope = buildInboundEnvelope({ from: number, fromName: `You (${number})`, body: text });
+      log("inbound from", phone, "->", String(text).slice(0, 80));
+      await rememberSender(cfg.bridgeDir, jid);
+      const envelope = buildInboundEnvelope({ from: phone, fromName: `You (${phone})`, body: text });
       try {
         await deliverInbound(cfg.teamsRoot, cfg.team, cfg.memberId, envelope);
         log("delivered to", cfg.team, "/", cfg.memberId);
@@ -155,11 +170,14 @@ setInterval(async () => {
   try {
     const replies = await drainOutbox(cfg.bridgeDir);
     for (const r of replies) {
-      const jid = `${r.to || (await lastSender(cfg.bridgeDir))}@s.whatsapp.net`;
-      if (!jid.startsWith("@s.whatsapp.net")) {
-        await sock.sendMessage(jid, { text: String(r.body || "") });
-        log("sent to", jid);
-      }
+      // to/lastSender may be a full jid ("11111111111@lid" or
+      // "1555...@s.whatsapp.net") or a bare number; only append the domain
+      // for bare numbers. baileys 7 sends to @lid jids directly.
+      const raw = String(r.to || (await lastSender(cfg.bridgeDir)) || "").trim();
+      if (!raw) continue;
+      const jid = raw.includes("@") ? raw : `${raw}@s.whatsapp.net`;
+      await sock.sendMessage(jid, { text: String(r.body || "") });
+      log("sent to", jid);
     }
   } catch (e) {
     log("outbox error:", e?.message);
