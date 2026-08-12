@@ -34,6 +34,7 @@ const sock = makeWASocket({
 
 let lastQr = null;
 let printedQr = false;
+let pairDone = false;
 
 sock.ev.on("connection.update", async (update) => {
   const { connection, lastDisconnect, qr } = update;
@@ -62,6 +63,27 @@ sock.ev.on("connection.update", async (update) => {
     lastQr = null;
     printedQr = false;
     log("connected to WhatsApp. Waiting for messages from owner numbers.");
+  }
+  if (connection === "connecting" && cfg.pair && !pairDone) {
+    pairDone = true;
+    // The socket must be fully up before requestPairingCode works; retry with
+    // delays instead of calling it on the first 'connecting' tick.
+    (async () => {
+      for (let attempt = 1; attempt <= 8; attempt++) {
+        try {
+          const code = await sock.requestPairingCode(cfg.pair);
+          const pretty = `${code.slice(0, 4)}-${code.slice(4)}`;
+          console.log(`\n=== PAIRING CODE (instead of QR): ${pretty} ===`);
+          console.log("On the phone: WhatsApp -> Settings -> Linked devices -> Link a device -> Link with phone number instead -> enter the code.");
+          const { writeFile } = await import("node:fs/promises");
+          await writeFile(`${cfg.bridgeDir}/pair-code.txt`, `${pretty}\n`, "utf8");
+          return;
+        } catch (e) {
+          log(`pairing attempt ${attempt}/8 failed: ${e?.message}`);
+          await new Promise((r) => setTimeout(r, 4000));
+        }
+      }
+    })();
   }
   if (connection === "close") {
     const code = lastDisconnect?.error?.output?.statusCode;

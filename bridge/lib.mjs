@@ -17,6 +17,9 @@ export function loadConfig(env = process.env) {
     owners,
     team: env.WA_TEAM?.trim() || "Dispatch",
     memberId: env.WA_MEMBER_ID?.trim() || "dispatcher-main",
+    // Optional pairing-code linking (more reliable than QR): set WA_PAIR to
+    // your number and enter the 8-digit code on the phone instead of scanning.
+    pair: env.WA_PAIR?.trim() || null,
   };
 }
 
