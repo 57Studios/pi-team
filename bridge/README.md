@@ -44,11 +44,14 @@ The dispatcher auto-reads each WhatsApp message, routes work via the team tool
 --team X --project <repo>`), and replies with `team wa_reply --body "..."`.
 Coordinators can DM it back (`to:"Dispatch/Dispatcher"`) — it relays to you.
 
-## Control
+## Control (from ANY directory)
 
 ```bash
-./bridge.sh start|stop|status|logs
+bridge/scripts/install-global.sh   # one time: installs global 'bridge' + 'dispatch'
+bridge start|stop|status|logs      # any directory
+dispatch                           # run the dispatcher agent
 ```
+(Or the repo-root form: `./bridge.sh start|stop|status|logs`.)
 
 Stopping keeps the WhatsApp session — **no rescan needed** next start.
 
