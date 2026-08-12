@@ -28,12 +28,20 @@ const { version } = await fetchLatestBaileysVersion();
 const sock = makeWASocket({
   version,
   auth: state,
-  // macOS/Safari fingerprint: WhatsApp's server bounces the default
-  // Ubuntu/Chrome UA (connection closed 515 mid-link). macOS/Safari held a
-  // 90s probe stable; Ubuntu/Chrome closed within ~50s every time.
-  browser: Browsers.macOS("Safari"),
+  // Custom browser fingerprint (pattern proven in production by Hermes Agent's
+  // bridge: standard Browsers.* fingerprints get flagged after repeated failed
+  // links; a custom UA string is accepted). Do NOT switch back to Browsers.*.
+  browser: ["pi-team", "Chrome", "120.0"],
+  // Required for Baileys 7.x: without this, incoming messages that need E2EE
+  // session re-establishment are silently dropped (msg.message === null) —
+  // which stalls the linking handshake itself. From Hermes Agent's bridge.
+  getMessage: async () => ({ conversation: "" }),
+  syncFullHistory: false,
+  markOnlineOnConnect: false,
   printQRInTerminal: false, // we print our own (once, scannable)
-  logger: pino({ level: "silent" }), // baileys internals stay quiet; we log ourselves
+  // 'warn' (not silent): baileys' own warnings/errors carry the real reason
+  // behind a failed link — e.g. protocol rejections — straight to bridge.log.
+  logger: pino({ level: "warn" }),
 });
 
 let lastQr = null;
@@ -89,9 +97,13 @@ sock.ev.on("connection.update", async (update) => {
       }
     })();
   }
+  if (connection === "open") {
+    log("connected to WhatsApp ✓ (session live)");
+  }
   if (connection === "close") {
     const code = lastDisconnect?.error?.output?.statusCode;
-    log("connection closed", code || "");
+    const msg = lastDisconnect?.error?.message || lastDisconnect?.error?.toString?.() || "";
+    log("connection closed", code || "", msg ? `— ${msg}` : "");
     if (code === DisconnectReason.loggedOut) {
       log("logged out from the phone — delete", `${cfg.bridgeDir}/auth`, "and rescan to re-link.");
       process.exit(0);
