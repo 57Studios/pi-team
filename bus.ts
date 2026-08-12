@@ -1707,14 +1707,17 @@ export async function savePreset(root, team, members) {
   await writeJsonAtomic(file, {
     name: team,
     savedAt: Date.now(),
-    members: members.map((m) => ({ name: m.name, role: sanitizeRole(m.role) })),
+    // Preserve stable member ids (e.g. dispatcher-main) so external bridges
+    // (WhatsApp) can keep addressing the same inbox across rejoins.
+    members: members.map((m) => ({ name: m.name, role: sanitizeRole(m.role), ...(m.id ? { id: m.id } : {}) })),
   });
   return { ok: true };
 }
 
-export async function upsertPresetMember(root, team, name, role) {
+export async function upsertPresetMember(root, team, name, role, extra = {}) {
   const preset = (await loadPreset(root, team)) || { name: team, savedAt: Date.now(), members: [] };
-  const entry = { name, role: sanitizeRole(role) };
+  const prev = preset.members.find((m) => m.name === name) || {};
+  const entry = { name, role: sanitizeRole(role), ...(prev.id ? { id: prev.id } : {}), ...(extra.id ? { id: extra.id } : {}) };
   const idx = preset.members.findIndex((m) => m.name === name);
   if (idx >= 0) preset.members[idx] = entry;
   else preset.members.push(entry);

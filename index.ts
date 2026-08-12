@@ -120,7 +120,7 @@ export default function (pi: ExtensionAPI) {
     if (!c2) return null;
     const cfg = envCfg();
     const env = cfg.team
-      ? { root: cfg.root, team: cfg.team, name: cfg.name, role: cfg.role }
+      ? { root: cfg.root, team: cfg.team, name: cfg.name, role: cfg.role, id: cfg.id }
       : null;
     const ident = env || sessionIdentity(c2);
     if (!ident) return null;
@@ -548,8 +548,14 @@ export default function (pi: ExtensionAPI) {
     if (launchedFromFlag) return;
     launchedFromFlag = true;
     const root = bus.teamsRoot(process.env);
+    // User-facing alias: `pi --team Dispatcher` -> the Dispatch team (whose
+    // single member is named Dispatcher). Keeps the command natural without
+    // renaming the team (the WhatsApp bridge + run-dispatcher.sh target
+    // "Dispatch").
+    const TEAM_ALIASES: Record<string, string> = { dispatcher: "Dispatch" };
+    const target = TEAM_ALIASES[team.trim().toLowerCase()] || team;
     // Case-insensitive team-name resolution: `--team zilla` finds "Zilla".
-    const resolved = (await bus.resolveTeamName(root, team)) || team;
+    const resolved = (await bus.resolveTeamName(root, target)) || target;
     let preset = null;
     try {
       preset = await bus.loadPreset(root, resolved);
@@ -579,6 +585,9 @@ export default function (pi: ExtensionAPI) {
     process.env.PI_TEAM = resolved;
     process.env.PI_TEAM_NAME = coord.name;
     process.env.PI_TEAM_ROLE = coord.role;
+    // Stable member id from the preset (e.g. dispatcher-main) so external
+    // bridges (WhatsApp) can deliver straight into this member's inbox.
+    if ((coord as any)?.id) process.env.PI_TEAM_ID = (coord as any).id;
     process.env.PI_TEAM_DIR = root;
     const me = await myTeam(c);
     if (!me) return;
@@ -1965,7 +1974,7 @@ export default function (pi: ExtensionAPI) {
     const name = String(p.name || "").trim();
     const prompt = String(p.prompt || "").trim();
     const cwd = c.cwd || process.cwd();
-    const envPart = `PI_TEAM=${shq(me.team)} PI_TEAM_ROLE=${shq(role)} PI_TEAM_NAME=${shq(name)} PI_TEAM_DIR=${shq(me.root)}`;
+    const envPart = `PI_TEAM=${shq(me.team)} PI_TEAM_ROLE=${shq(role)} PI_TEAM_NAME=${shq(name)} PI_TEAM_DIR=${shq(me.root)}${(p as any)?.id ? ` PI_TEAM_ID=${shq((p as any).id)}` : ""}`;
     const who = name || role;
     // Title the terminal window before pi even boots (OSC 0 window-title
     // escape). pi re-applies the same title via ctx.ui.setTitle on session

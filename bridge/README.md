@@ -36,8 +36,14 @@ Scan with your phone: **WhatsApp → Settings → Linked devices → Link a devi
 ## Run the dispatcher
 
 ```bash
-scripts/run-dispatcher.sh pi        # a pi session that answers WhatsApp
+pi --team Dispatcher                # like pi --team Alpha / --team Zilla — opens
+                                    # a terminal that becomes the Dispatcher agent
+# (equivalent, explicit: scripts/run-dispatcher.sh pi)
 ```
+
+`pi --team Dispatcher` is an alias for the Dispatch team (its single preset
+member is named Dispatcher). It joins with the stable member id
+`dispatcher-main`, which is exactly the inbox the bridge delivers into.
 
 The dispatcher auto-reads each WhatsApp message, routes work via the team tool
 (`roster --team X`, `checkin`, `dm to:"Alpha/Optimus"`, `task_create
