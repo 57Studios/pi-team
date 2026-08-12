@@ -147,7 +147,13 @@ async function startSocket() {
       if (!text) continue;
       // WhatsApp now routes inbound DMs by LID (@lid) rather than phone
       // number; resolve the LID to the owner's phone for the allowlist.
-      const { jid, phone } = resolveSender(m.key.remoteJid, lidMap);
+      let { jid, phone } = resolveSender(m.key.remoteJid, lidMap);
+      if (!phone && jid?.endsWith("@lid")) {
+        // The mapping file may have been written by this very message —
+        // force one refresh and retry before giving up (fail closed).
+        await refreshLidMap(true);
+        ({ jid, phone } = resolveSender(m.key.remoteJid, lidMap));
+      }
       if (!phone || !isAllowed(phone, cfg.owners)) {
         log("ignored message from non-owner:", m.key.remoteJid, phone ? `(resolved ${phone})` : "(no lid mapping)");
         continue;
