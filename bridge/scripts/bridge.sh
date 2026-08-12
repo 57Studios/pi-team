@@ -22,7 +22,7 @@ case "$cmd" in
     sleep 3
     if alive; then
       echo "started (pid $(cat "$PIDFILE")). Logs: $LOGFILE"
-      echo "first run: scan the QR it prints —  scripts/bridge.sh logs"
+      echo "first run: cat $BRIDGE_DIR/qr.txt (or: bridge logs) and scan it — the QR rotates ~20s, qr.txt always holds the latest"
     else
       echo "FAILED to start — check the log:"; tail -5 "$LOGFILE" 2>/dev/null || true
       exit 1

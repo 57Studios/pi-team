@@ -5,7 +5,7 @@
 //
 // Session auth lives in ~/.pi/wa-bridge/auth (OUTSIDE the repo) — never commit it.
 import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from "baileys";
-import qrcode from "qrcode-terminal";
+import QRCode from "qrcode";
 import pino from "pino";
 import { loadConfig, isAllowed, buildInboundEnvelope, deliverInbound, drainOutbox, rememberSender } from "./lib.mjs";
 
@@ -33,16 +33,34 @@ const sock = makeWASocket({
 });
 
 let lastQr = null;
+let printedQr = false;
 
 sock.ev.on("connection.update", async (update) => {
   const { connection, lastDisconnect, qr } = update;
   if (qr) {
     lastQr = qr;
-    console.log("\n=== SCAN THIS QR in WhatsApp: Settings -> Linked devices -> Link a device ===\n");
-    qrcode.generate(qr, { small: true });
+    try {
+      // Plain-text QR (no ANSI colors): always write the LATEST to qr.txt so
+      // it survives log scrolling/rotation; print to console once per attempt.
+      const text = await QRCode.toString(qr, { type: "utf8", small: true });
+      const { writeFile, mkdir } = await import("node:fs/promises");
+      await mkdir(cfg.bridgeDir, { recursive: true });
+      await writeFile(
+        `${cfg.bridgeDir}/qr.txt`,
+        `Scan within ~20s (the QR rotates). WhatsApp -> Settings -> Linked devices -> Link a device.\n\n${text}\n`,
+      );
+      if (!printedQr) {
+        printedQr = true;
+        console.log("\n=== SCAN THIS QR (fresh copy always at " + cfg.bridgeDir + "/qr.txt) ===\n");
+        console.log(text);
+      }
+    } catch (e) {
+      console.error("QR render failed:", e?.message);
+    }
   }
   if (connection === "open") {
     lastQr = null;
+    printedQr = false;
     log("connected to WhatsApp. Waiting for messages from owner numbers.");
   }
   if (connection === "close") {
