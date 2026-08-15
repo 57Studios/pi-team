@@ -822,7 +822,64 @@ const main = async () => {
 
 
   console.log(`\nAll bus tests passed (${passed} assertions).`);
-  fs.rmSync(root, { recursive: true, force: true });
+    await t("sweepInbox removes stale mail, keeps fresh, drops empty dirs", async () => {
+    const r = path.join(root, "hyg");
+    await bus.createTeam(r, "t1", {});
+    await bus.joinMember(r, "t1", { id: "m1", name: "Ann", role: "implementer" });
+    const inbox = path.join(bus.teamDir(r, "t1"), "inbox", "m1");
+    fs.mkdirSync(inbox, { recursive: true });
+    const old = Date.now() - bus.INBOX_MAX_AGE_MS - 60_000;
+    const fresh = Date.now() - 60_000;
+    fs.writeFileSync(path.join(inbox, "old.json"), JSON.stringify({ ts: old }));
+    fs.writeFileSync(path.join(inbox, "new.json"), JSON.stringify({ ts: fresh }));
+    fs.utimesSync(path.join(inbox, "old.json"), new Date(old), new Date(old));
+    fs.utimesSync(path.join(inbox, "new.json"), new Date(fresh), new Date(fresh));
+    const res = await bus.sweepInbox(r, "t1");
+    ok("swept exactly the stale file", res.removed === 1);
+    ok("fresh file survived", fs.existsSync(path.join(inbox, "new.json")));
+    // a member dir whose ONLY mail is stale gets removed once swept empty
+    fs.unlinkSync(path.join(inbox, "new.json"));
+    fs.writeFileSync(path.join(inbox, "old2.json"), JSON.stringify({}));
+    fs.utimesSync(path.join(inbox, "old2.json"), new Date(old), new Date(old));
+    await bus.sweepInbox(r, "t1");
+    ok("member dir removed after its last stale file was swept", !fs.existsSync(inbox));
+    fs.rmSync(r, { recursive: true, force: true });
+  });
+
+  await t("sweepCheckins expires records older than a week", async () => {
+    const r = path.join(root, "hyg2");
+    await bus.createTeam(r, "t2", {});
+    await bus.setCheckin(r, "t2", "c1", { question: "status?", targets: [] });
+    const file = path.join(bus.teamDir(r, "t2"), "checkins.json");
+    const all = JSON.parse(fs.readFileSync(file, "utf8"));
+    all.c1.sentAt = Date.now() - bus.CHECKIN_MAX_AGE_MS - 60_000; // stale
+    all.c2 = { by: "c2", question: "ok?", targets: [], sentAt: Date.now() };
+    fs.writeFileSync(file, JSON.stringify(all));
+    const dropped = await bus.sweepCheckins(r, "t2");
+    ok("dropped the stale checkin, kept the fresh one", dropped === 1);
+    const kept = JSON.parse(fs.readFileSync(file, "utf8"));
+    ok("c2 survived", !!kept.c2 && !kept.c1);
+    fs.rmSync(r, { recursive: true, force: true });
+  });
+
+  await t("pruneSessions dry-run counts, apply deletes (newest per dir kept)", async () => {
+    const r = path.join(root, "sess");
+    fs.mkdirSync(path.join(r, "projA"), { recursive: true });
+    const old = Date.now() - 30 * 24 * 3600 * 1000;
+    fs.writeFileSync(path.join(r, "projA", "old1.jsonl"), "x");
+    fs.writeFileSync(path.join(r, "projA", "old2.jsonl"), "x");
+    fs.writeFileSync(path.join(r, "projA", "new.jsonl"), "x");
+    for (const f of ["old1.jsonl", "old2.jsonl"]) fs.utimesSync(path.join(r, "projA", f), new Date(old), new Date(old));
+    const dry = await bus.pruneSessions({ sessionsRoot: r, olderThanMs: 7 * 24 * 3600 * 1000, apply: false });
+    ok("dry-run counts 2 removables, keeps newest", dry.ok && dry.removable === 2);
+    ok("dry-run deleted nothing", fs.existsSync(path.join(r, "projA", "old1.jsonl")));
+    const wet = await bus.pruneSessions({ sessionsRoot: r, olderThanMs: 7 * 24 * 3600 * 1000, apply: true });
+    ok("apply removed both old files", wet.removable === 2 && !fs.existsSync(path.join(r, "projA", "old1.jsonl")) && !fs.existsSync(path.join(r, "projA", "old2.jsonl")));
+    ok("newest survived", fs.existsSync(path.join(r, "projA", "new.jsonl")));
+    fs.rmSync(r, { recursive: true, force: true });
+  });
+
+fs.rmSync(root, { recursive: true, force: true });
 };
 
 main().catch((e) => {

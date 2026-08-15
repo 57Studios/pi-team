@@ -1617,6 +1617,185 @@ export async function sweepTeam(root, team) {
   }
   await pruneMembers(root, team, { olderThanMs: AUTO_PRUNE_OLDER_MS }).catch(() => {});
   await rotateLogIfNeeded(root, team).catch(() => {});
+  await sweepInbox(root, team).catch(() => {});
+  await sweepCheckins(root, team).catch(() => {});
+}
+
+// Inbox hygiene: undelivered/stale message files older than a week are dead
+// weight (a live watcher drains them; a dead member's inbox otherwise grows
+// forever — Alpha once held 580KB of stale mail). Empty member dirs and
+// empty stray dirs (e.g. a botched "wa1") are removed too.
+export const INBOX_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+export async function sweepInbox(root, team) {
+  const inboxRoot = path.join(teamDir(root, team), "inbox");
+  let subs = [];
+  try {
+    subs = await fsp.readdir(inboxRoot);
+  } catch {
+    return { removed: 0 }; // no inbox yet
+  }
+  const now = Date.now();
+  let removed = 0;
+  for (const s of subs) {
+    const sub = path.join(inboxRoot, s);
+    let files = [];
+    try {
+      files = await fsp.readdir(sub);
+    } catch {
+      continue;
+    }
+    for (const f of files) {
+      if (!f.endsWith(".json")) continue;
+      const full = path.join(sub, f);
+      try {
+        const st = await fsp.stat(full);
+        if (now - st.mtimeMs > INBOX_MAX_AGE_MS) {
+          await fsp.unlink(full);
+          removed++;
+        }
+      } catch {
+        /* gone already */
+      }
+    }
+    // drop the dir only once it is empty (never delete a member's live inbox)
+    try {
+      const left = await fsp.readdir(sub);
+      if (left.length === 0) await fsp.rm(sub, { recursive: true, force: true });
+    } catch {
+      /* gone */
+    }
+  }
+  return { removed };
+}
+
+// Checkin records expire after a week — stale replies otherwise accumulate.
+export const CHECKIN_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+export async function sweepCheckins(root, team) {
+  const file = checkinsFile(root, team);
+  let all = {};
+  try {
+    all = JSON.parse(await fsp.readFile(file, "utf8"));
+  } catch {
+    return 0;
+  }
+  const now = Date.now();
+  const keep = {};
+  let dropped = 0;
+  for (const [id, rec] of Object.entries(all)) {
+    if (rec && now - (rec.sentAt || 0) <= CHECKIN_MAX_AGE_MS) keep[id] = rec;
+    else dropped++;
+  }
+  if (dropped) await writeJsonAtomic(file, keep);
+  return dropped;
+}
+
+// pi's session store (~/.pi/agent/sessions/<cwd-slug>/<file>.jsonl): every
+// spawned member window and test run writes one and NOTHING prunes them
+// (measured 92 MB / 173 files). Keep the newest session per cwd-slug, drop
+// the rest older than olderThanMs. apply=false = dry-run (count only).
+export async function pruneSessions({ olderThanMs = 7 * 24 * 60 * 60 * 1000, apply = false, sessionsRoot = null } = {}) {
+  const root =
+    sessionsRoot || path.join(os.homedir(), ".pi", "agent", "sessions");
+  let dirs = [];
+  try {
+    dirs = await fsp.readdir(root);
+  } catch {
+    return { ok: false, error: `no sessions dir at ${root}` };
+  }
+  const now = Date.now();
+  let removable = 0;
+  let removableBytes = 0;
+  for (const d of dirs) {
+    const full = path.join(root, d);
+    let files = [];
+    try {
+      files = await fsp.readdir(full);
+    } catch {
+      continue;
+    }
+    const jsons = files.filter((f) => f.endsWith(".jsonl"));
+    // the newest session in this dir always survives (max mtime — an
+    // inverted comparison here would keep the OLDEST file instead; the
+    // unit test for this caught that exact bug)
+    let newest = null;
+    let newestM = -Infinity;
+    for (const f of jsons) {
+      try {
+        const st = await fsp.stat(path.join(full, f));
+        if (st.mtimeMs > newestM) {
+          newestM = st.mtimeMs;
+          newest = f;
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+    for (const f of jsons) {
+      if (f === newest) continue;
+      const fullPath = path.join(full, f);
+      try {
+        const st = await fsp.stat(fullPath);
+        if (now - st.mtimeMs > olderThanMs) {
+          removable++;
+          removableBytes += st.size;
+          if (apply) await fsp.unlink(fullPath);
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  return { ok: true, removable, removableBytes, apply };
+}
+
+// Full-team hygiene across ALL teams + the pi session store. apply=false =
+// dry-run report (nothing deleted).
+export async function teamCleanup(root, { apply = false, olderThanMs = 7 * 24 * 60 * 60 * 1000 } = {}) {
+  let teams = [];
+  try {
+    teams = (await fsp.readdir(root)).filter((t) => t !== "wa1");
+  } catch {
+    /* no teams root */
+  }
+  const report = { teams: [], sessions: null, dryRun: !apply };
+  for (const t of teams) {
+    const base = teamDir(root, t);
+    const entry = { team: t, logBytes: 0, inboxBytes: 0, inboxFiles: 0, checkins: 0 };
+    try {
+      entry.logBytes = (await fsp.stat(path.join(base, "log.jsonl"))).size;
+    } catch {
+      /* no log */
+    }
+    try {
+      const inboxRoot = path.join(base, "inbox");
+      for (const s of await fsp.readdir(inboxRoot)) {
+        const sub = path.join(inboxRoot, s);
+        for (const f of await fsp.readdir(sub).catch(() => [])) {
+          if (!f.endsWith(".json")) continue;
+          const st = await fsp.stat(path.join(sub, f)).catch(() => null);
+          if (st) {
+            entry.inboxBytes += st.size;
+            entry.inboxFiles++;
+          }
+        }
+      }
+    } catch {
+      /* no inbox */
+    }
+    try {
+      entry.checkins = Object.keys(JSON.parse(await fsp.readFile(path.join(base, "checkins.json"), "utf8"))).length;
+    } catch {
+      /* none */
+    }
+    if (apply) {
+      await sweepTeam(root, t).catch(() => {});
+    }
+    report.teams.push(entry);
+  }
+  report.sessions = await pruneSessions({ olderThanMs, apply });
+  return report;
 }
 
 // ---------------------------------------------------------------------------

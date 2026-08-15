@@ -1302,6 +1302,33 @@ export default function (pi: ExtensionAPI) {
         return `Board cleared: archived ${res.archived} task${res.archived === 1 ? "" : "s"} (${res.done} done) to ${res.archive}${res.topicsCleared ? `; cleared ${res.topicsCleared} board topic(s)` : ""}. ${store.kind === "project" ? `Project board (${store.dir})` : `Team "${me.team}"`} is ready for a new project.`;
       }
 
+      case "cleanup": {
+        // Disk hygiene across ALL teams + pi's session store. Dry-run by
+        // default: reports sizes and what WOULD be swept. --apply executes:
+        // stale inbox mail (>7d), expired checkins, dead-member prune, log
+        // rotation, and old session files (newest per cwd kept).
+        if (!me) return notInTeam;
+        if (!bus.hasRole(me.role, "coordinator")) return "error: only a coordinator can run team cleanup.";
+        const apply = p.apply === true || p.apply === "true";
+        const days = Math.max(1, parseInt(String(p["older-than-days"] || p.days || "7"), 10) || 7);
+        const olderThanMs = days * 24 * 60 * 60 * 1000;
+        const res = await bus.teamCleanup(root, { apply, olderThanMs });
+        const lines: string[] = [res.dryRun ? "CLEANUP REPORT (dry run — nothing deleted; add --apply to execute):" : "CLEANUP DONE:"];
+        for (const t of res.teams) {
+          const inbox = t.inboxBytes ? `${(t.inboxBytes / 1024).toFixed(0)}KB/${t.inboxFiles} files` : "empty";
+          const log = t.logBytes ? `${(t.logBytes / 1024).toFixed(0)}KB` : "—";
+          lines.push(`  ${t.team}: log ${log}, inbox ${inbox}, checkins ${t.checkins}`);
+        }
+        if (res.sessions?.ok) {
+          const mb = ((res.sessions.removableBytes || 0) / (1024 * 1024)).toFixed(1);
+          lines.push(`  pi sessions: ${res.sessions.removable} file(s) older than ${days}d would free ${mb}MB (newest per project kept)${res.sessions.apply ? " — deleted" : ""}`);
+        } else {
+          lines.push(`  pi sessions: ${res.sessions?.error || "unknown"}`);
+        }
+        if (!res.dryRun) lines.push("Inbox sweep: stale mail >7d removed, empty member dirs removed, checkins >7d expired, dead members >7d pruned, logs rotated at 5MB.");
+        return lines.join("\n");
+      }
+
       case "wa_reply": {
         if (!me) return notInTeam;
         const body = String(p.body || "").trim();
